@@ -33,7 +33,7 @@
 - コマンドバッファはスタックマシンである。ノード生成（`div`/`text`）がハンドルを内部スタックへ push し、セッターはスタックトップに適用され、`add_child` は child・parent の順に pop して parent を再 push し、`set_root` はトップを pop してルートにする。
 - `FfiView::render` は、mutex を保持したまま自分の view のコミット済みルートをクローンして `VIEWS` をスナップショットし、mutex を解放してから GPUI の要素/リスナーを構築する。これによりロックをリスナーとコールバックの経路から外す。コミット済みツリーがなければ空で描画する。
 - 外側の Rust レンダリングコンテナ（MoonBit が生成したルートノードではない）は全サイズの flex column で、`FfiView.focus` を追跡し `on_key_down` を受け取る。このリスナーは Tab / Shift+Tab を消費して `win.focus_next()` / `win.focus_prev()` を呼び（issue #52 のキーボードナビゲーション、MoonBit には転送しない）、それ以外のキーを通常の key/text dispatch へ流す。各 div の GPUI `ElementId` は次の優先順で決まる: 安定キーがあれば `"gpui_key:{key}"`、なければクリック可能 div は `("gpui_click", click_id)`、キーもクリックもないスクロール div は描画ごとの一時 id `("gpui_scroll", n)`、キーもクリックもない focusable div は一時 id `("gpui_focus", n)`。クリック可能な div には `on_click` リスナーが割り当てられる。
-- 状態変更イベントの後、MoonBit はツリーを更新する。既定の正しい経路は新しいコマンドバッファでツリーをゼロから再構築して `build_tree` することである。デモ（`app.mbt`）はまず `update_text(view, COUNT_KEY, …)` によるキー付きテキストノードの**その場更新**（issue #10）を試み、失敗（`GPUI_STATUS_KEY_NOT_FOUND`）時のみフルリビルドにフォールバックする。何もしないイベントは再構築も commit もスキップする。
+- 状態変更イベントの後、MoonBit はツリーを更新する。既定の正しい経路は新しいコマンドバッファでツリーをゼロから再構築して `build_tree` することである。Counter example（`examples/counter/counter/counter.mbt`）はまず `update_text(view, COUNT_KEY, …)` によるキー付きテキストノードの**その場更新**（issue #10）を試み、失敗（`GPUI_STATUS_KEY_NOT_FOUND`）時のみフルリビルドにフォールバックする。何もしないイベントは再構築も commit もスキップする。
 - **安定ノード識別（issue #9）**: `set_key(key)` は div に明示的な安定キーを設定する。設定されたキーは GPUI の `ElementId`（`"gpui_key:{key}"`）になり、クリック有無に関わらず再構築を跨いで stateful element の同一性を保つ。キー未設定のクリック可能 div は従来どおり click_id から ID を合成する（`"gpui_click"`）。click_id はアクションルーティング専用であり、キーとは独立（click_id の重複は許容、キーの重複は `build_tree` が拒否）。
 - **スクロール状態の保持（issue #51 G6）**: `OP_SET_OVERFLOW` で `SCROLL` を指定した軸を持つ div は実際のスクロールコンテナになる。`render_node` は各スクロール div に gpui の `ScrollHandle` を割り当てるが、ツリーは状態変更のたびにゼロから再構築されるため、ハンドルはツリーの外で保持される。保持先は view ごとの `FfiView.scroll_handles: Rc<RefCell<HashMap<String, ScrollHandle>>>` で、`OP_SET_KEY` の値をキーにする。`ScrollHandle` は `Rc` ベースで `Send` でないため、`Mutex` 下のグローバル `VIEWS` には置けず、メインスレッド専用である view エンティティ内に置く。キー付きスクロール div は再構築を跨いでスクロール位置を維持し、キーなしスクロール div は毎回の再構築で新しいハンドル（先頭位置）になる。スクロール追跡には element state が必要なため、スクロール div は常に GPUI id を持つ（キー付きは `"gpui_key:{key}"`、キーなしは一時 id `"gpui_scroll"`）。
 - **キーボードナビゲーション（issue #52）**: `OP_SET_FOCUSABLE` / `OP_SET_TAB_INDEX` / `OP_SET_TAB_STOP` は div を gpui のフォーカス可能要素にする（`.focusable()` / `.tab_index()` / `.tab_stop()`）。これらは `StatefulInteractiveElement` にあるため element id が要る: キーもクリック id もない focusable div には描画ごとの一時 id（`"gpui_focus"`）が合成され、再構築のたびにフォーカスハンドルがリセットされる（再構築を跨ぐ安定フォーカスには `set_key` を使う）。`tab_index` / `tab_stop` の設定は暗黙に focusable を含む。Tab トラバース自体は外側コンテナの `on_key_down` が所有し（上記）、MoonBit の `dispatch` には届かない。
@@ -50,7 +50,7 @@
 | `gpui_build_tree(view, const uint8_t *ptr, int32_t len) -> i32` | `build_tree(view, cb)` — コマンドバッファ 1 回でツリーを構築・コミット |
 | `gpui_run_window(view, w, h)` | `run_window(view, w, h)` — view のコミット済みツリーを描くウィンドウを開き、GPUI イベントループ内でブロックする |
 | `gpui_update_text(view, key_ptr, key_len, text_ptr, text_len) -> i32` | `update_text(view, key, text)` — キー付き div の最初のテキスト子をその場で更新（issue #10）。失敗時は `build_tree` へフォールバック |
-| `gpui_event_copy_text(token, buf, len) -> i32` | `app.mbt` 内の `gpui_event_copy_text_ffi`（直接 FFI）— `EVENT_TEXT` のペイロードを同期コピー |
+| `gpui_event_copy_text(token, buf, len) -> i32` | `gpui_event_copy_text_ffi`（`gpui-bindings-ffi.mbt`）— `decode_event`（`event.mbt` の `EVENT_TEXT` 分岐）と `copy_async_payload` がペイロードを同期コピー |
 | `gpui_debug_dump_text(view, buf, len) -> i32` | `debug_dump_text(view)` — コミット済みツリーの全テキストを DFS pre-order で読み戻す（デバッグ・往復テスト用） |
 | `gpui_abi_probe(value) -> i32` | `abi_probe(v)` — `Int` == `i32` の境界横断往復検証（`cmd/roundtrip` がビルドごとに実行） |
 | `gpui_post_event(view, const uint8_t *ptr, int32_t len) -> i32` | `post_event(view, payload)` — 任意スレッドから `view` へ非同期イベントを注入（RFC 0002）。ペイロードは呼び出し中にコピーされ即座に戻る。`EVENT_ASYNC` としてメインスレッドで配送される |
@@ -206,11 +206,11 @@ Tab / Shift+Tab は外側コンテナの `on_key_down` が消費してフォー�
 6. MoonBit のリンク済み出力を削除して再度ビルドし、新しい Rust 静的ライブラリと Cargo 由来のネイティブ依存に対して強制的に再リンクする。
 7. リンケージを検証する。macOS/Linux は最終バイナリを調べ、コールバック定義がちょうど 1 つであることを確認する。Windows は、MoonBit の `main.obj` にコールバック定義が 1 つ、`gpui_sys.lib` に未解決参照が 1 つあること、および最終リンクが成功することを検証する（リンク済み PE は通常 COFF シンボルテーブルを省略するため）。
 8. ヘッドレス往復テスト（`cmd/roundtrip`）を実行する。MoonBit がエッジケースのテキスト（NUL バイト・多バイト UTF-8・4 バイト絵文字）を含むツリーを `gpui_build_tree` で送信し、`gpui_debug_dump_text` で読み戻してバイト単位で比較する。さらに `gpui_abi_probe` で `i32` 境界値（`i32::MAX` / `i32::MIN` / 0 / -1）の往復を検証する（issue #54 G23）。GUI なしで MoonBit→C→Rust→C→MoonBit の完全な FFI 往復を検証する（issue #34）。
-9. macOS のみ: `bundle.sh` を呼び出して実行ファイルを `dist/Counter.app` にバンドルする（デフォルト。`--no-bundle` で省略）。素の Mach-O バイナリには macOS がキーボードイベントを配送しないため、キーボード入力に必要である。
+9. macOS のみ: `bundle.sh` を呼び出して実行ファイルを `dist/Runner.app` にバンドルする（デフォルト。`--no-bundle` で省略）。素の Mach-O バイナリには macOS がキーボードイベントを配送しないため、キーボード入力に必要である。
 
 bindgen ステップは、同じドライバ実行内で直前に `gen-header` が再生成したヘッダーを消費する。したがって、Rust の C エクスポートを追加/変更した後はドライバを 1 回実行するだけで、ヘッダーと追跡対象の `gpui-bindings-ffi.mbt` が同期する（issue #71 でデッドロックだった旧順序を修正済み）。`gen-header` は cbindgen のみに依存し gpui をビルドしないため、この前段階は軽い。`gpui-sys/build.rs` も同じ cbindgen 呼び出しを残しており、素の `cargo build` でのヘッダー再生成を担う（冪等）。
 
-`gpui-sys` は `staticlib` である。その未解決の `mb_dispatch` 参照は、最終的な MoonBit 実行ファイルのリンク時にのみ解決される。プラットフォームのテンプレートには、検出された Rust ライブラリディレクトリと Cargo 由来のネイティブリンクフラグ用のプレースホルダが含まれる。Linux は上述の SONAME 互換正規化を適用する。macOS ではドライバが最後に `bundle.sh` を呼び出して `dist/Counter.app` を作成する（デフォルト。`--no-bundle` で省略）。キーボードの配送にはこのバンドルが必要である。Linux では実行ファイルを直接使う。`.linux-libs` は、利用できないシステムの XCB/XKB ランタイムライブラリ用の、無視されるローカルフォールバックである。WSLg では `env -u WAYLAND_DISPLAY` が確実な明示的 X11 起動方法である。Rust は Wayland 起動時の panic を捕捉し、その変数を除去して 1 度だけ再試行する。Windows は `build.ps1` が用意する MSVC x64 セットアップを使う。
+`gpui-sys` は `staticlib` である。その未解決の `mb_dispatch` 参照は、最終的な MoonBit 実行ファイルのリンク時にのみ解決される。プラットフォームのテンプレートには、検出された Rust ライブラリディレクトリと Cargo 由来のネイティブリンクフラグ用のプレースホルダが含まれる。Linux は上述の SONAME 互換正規化を適用する。macOS ではドライバが最後に `bundle.sh` を呼び出して `dist/Runner.app` を作成する（デフォルト。`--no-bundle` で省略）。キーボードの配送にはこのバンドルが必要である。Linux では実行ファイルを直接使う。`.linux-libs` は、利用できないシステムの XCB/XKB ランタイムライブラリ用の、無視されるローカルフォールバックである。WSLg では `env -u WAYLAND_DISPLAY` が確実な明示的 X11 起動方法である。Rust は Wayland 起動時の panic を捕捉し、その変数を除去して 1 度だけ再試行する。Windows は `build.ps1` が用意する MSVC x64 セットアップを使う。
 
 ### 6.1 prebuild パイプライン（依存として消費、#93 / G2）
 

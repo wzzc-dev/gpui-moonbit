@@ -2,7 +2,7 @@
 
 | 項目 | 内容 |
 |---|---|
-| ステータス | 設計確定(2026-08-05)。実装は #125 の管轄。実装後の権威は [`architecture.md`](../architecture.md) |
+| ステータス | 実装済み(#125)。registry 消費の残件(§6-3)は #132 の管轄。現行実装の権威は [`architecture.md`](../architecture.md)であり、本 RFC は設計判断とその根拠の記録である |
 | 作成日 | 2026-08-05 |
 | 対象 | Rust→MoonBit コールバックの束縛機構(公開 ABI のリンク時契約) |
 | 関連 issue | #125(本 RFC・実装)、#92(ライブラリ方針)、#93(prebuild、前提)、#76(abi.toml 単一情報源)、#107(LinkConfig 二重適用 — cmd 再設計の別 issue が絡む) |
@@ -142,5 +142,5 @@ pub fn register_dispatch(f : (Int, Int, Int, Int, Int) -> Int) -> Unit
 
 1. ~~**警告の文言と出力先**~~ 解決(§3.3): MoonBit から stderr へ書く手段が無いため stdout(`println`)1 行、初回のみ。文言は `[gpui-bindings] warning: no dispatch registered; …`。
 2. ~~**suffix の具体値**~~ 解決: `_M0FP26nakake15gpui_2dbindings15dispatch__entry`(2026-08-06 実測)。導出元は `abi.toml` の `[callback]` の `name` と `module` に一本化され、build.sh / build.ps1 は suffix を、build.py と `gpui-sys/build.rs` は完全なシンボルを、いずれもそこから導く。
-3. **`_keep` 撤廃の成否**(§3.4): 検証結果で README の消費者手順が変わる。
-4. **cmd 再設計 issue の起票内容**: §4 のとおり別 issue(このリポジトリの issue トラッカー参照)。
+3. ~~**`_keep` 撤廃の成否**~~ 解決(§6-2): 成立。tests/consumer(別モジュール + path 依存)から `_keep` なしでリンク・実行できることを確認済みで、README は「不要」と記載(#125)。
+4. ~~**cmd 再設計 issue の起票内容**~~ 解決: #126 として起票済み。registry 消費対応(wrapper crate)は #132 で追跡し、両者を合わせて設計する。
