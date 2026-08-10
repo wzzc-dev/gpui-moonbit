@@ -83,7 +83,7 @@
     <h3>MoonBit が持つもの</h3>
     <ul>
       <li><code>main</code> エントリポイント（<code>moon run</code> で起動）</li>
-      <li>Counter の状態とイベントの意味づけ（<code>app.mbt</code>）</li>
+      <li>アプリの状態とイベントの意味づけ（消費者アプリ。例: <code>examples/counter</code>）</li>
       <li>UI ツリーの記述と <code>CommandBuffer</code> のエンコード</li>
     </ul>
   </div>
@@ -170,7 +170,7 @@
     <div class="t">GPUI 0.2.2（Zed）</div><div class="d">イベントループ。<code>run_window</code> がここでブロックする</div></div>
 
   <div class="node os" style="left:460px;top:705px;width:340px;height:56px">
-    <div class="t">ウィンドウ（macOS / Linux / Windows）</div><div class="d">macOS はキーボード配送に <code>dist/Counter.app</code> が必要</div></div>
+    <div class="t">ウィンドウ（macOS / Linux / Windows）</div><div class="d">macOS はキーボード配送に <code>dist/Runner.app</code> が必要</div></div>
 
   <!-- ===== 右: Rust 側の状態 ===== -->
   <div class="node abi" style="left:880px;top:398px;width:320px;height:76px">
@@ -261,9 +261,9 @@
     <table>
       <tr><th>slot</th><th>中身</th></tr>
       <tr><td>0</td><td><code>ABI_VERSION</code>（= 4）。不一致なら MoonBit が Unknown を返して拒否</td></tr>
-      <tr><td>1</td><td>イベント種別 CLICK=1 / KEY=2 / TEXT=3 / NAMED_KEY=4</td></tr>
+      <tr><td>1</td><td>イベント種別 CLICK=1 / KEY=2 / TEXT=3 / NAMED_KEY=4 / ASYNC=5 / INPUT_CHANGED=6 / INPUT_SUBMIT=7 / SCROLL=8</td></tr>
       <tr><td>2</td><td>view id（VIEWS のインデックス）</td></tr>
-      <tr><td>3, 4</td><td>data_a / data_b（click_id, コードポイント, token, 修飾キー…）</td></tr>
+      <tr><td>3, 4</td><td>data_a / data_b（click_id, コードポイント, token, 修飾キー, input_id, scroll_id…）</td></tr>
     </table>
   </div>
 </div>
@@ -286,6 +286,12 @@
   <tr><td><code>-8</code> NO_ROOT</td><td><code>OP_SET_ROOT</code> なしでバッファが終了</td></tr>
   <tr><td><code>-9</code> DUPLICATE_KEY</td><td>ツリー内でキーが重複</td></tr>
   <tr><td><code>-10</code> KEY_NOT_FOUND</td><td>update_text のキーが無い → フルリビルドへフォールバック</td></tr>
+  <tr><td><code>-11</code> QUEUE_FULL</td><td>非同期注入キューが満杯（1024 エントリ、RFC 0002）</td></tr>
+  <tr><td><code>-12</code> PAYLOAD_TOO_LARGE</td><td>注入ペイロードが 1 MiB 上限を超過（RFC 0002）</td></tr>
+  <tr><td><code>-13</code> BUSY_COMPOSING</td><td>IME 合成中の <code>input_set_text</code> を拒否（RFC 0003）</td></tr>
+  <tr><td><code>-14</code> INVALID_FLOAT</td><td>コマンドバッファ中の非有限 f32（NaN / ±Inf）をデコード時に拒否（#75）</td></tr>
+  <tr><td><code>-15</code> DEPTH_EXCEEDED</td><td>ツリーの入れ子が MAX_TREE_DEPTH（64）を超過（#74）</td></tr>
+  <tr><td><code>-16</code> INVALID_TEXT_RUN</td><td>テキスト run の範囲が不正（rich text、#91）</td></tr>
 </table>
 <p>MoonBit の高レベルラッパーは <code>Result[_, Int]</code> を返し、<code>classify_status</code> / <code>GpuiError</code> が生のコードを構造化エラーに分類する。</p>
 
@@ -369,7 +375,7 @@
     <div class="t">cargo → libgpui_sys.a</div><div class="d">staticlib。未解決の <code>mb_dispatch</code> 参照を残したまま出力される</div></div>
 
   <div class="node os" style="left:465px;top:580px;width:330px;height:70px">
-    <div class="t">最終リンク → 実行ファイル / dist/Counter.app</div><div class="d">MoonBit のリンク済み出力を消して再ビルドし、新しい .a に強制的に貼り直す</div></div>
+    <div class="t">最終リンク → 実行ファイル / dist/Runner.app</div><div class="d">MoonBit のリンク済み出力を消して再ビルドし、新しい .a に強制的に貼り直す</div></div>
 
   <div class="node dt" style="left:60px;top:580px;width:310px;height:70px">
     <div class="t">roundtrip ヘッドレステスト</div><div class="d">NUL・多バイト UTF-8・絵文字を送って読み戻し、バイト単位で比較</div></div>
@@ -414,7 +420,7 @@
   <tr><td>C エクスポートを増やす</td><td><code>gpui-sys/src/lib.rs</code> → ドライバ再実行 → <code>gpui-bindings-ffi.mbt</code> の同期を確認</td></tr>
   <tr><td>Rust だけ変更した</td><td>ルートドライバを使う（または <code>moon build</code> 前に MoonBit のリンク済み出力を明示的にクリーン）</td></tr>
   <tr><td>再構築を跨いで状態を保ちたい</td><td>その div に <code>set_key</code> を付ける（スクロール位置・フォーカス・その場更新の全てがこれに依存）</td></tr>
-  <tr><td>キーボードを macOS で試す</td><td>素の Mach-O ではイベントが来ない。<code>dist/Counter.app</code> を実行する</td></tr>
+  <tr><td>キーボードを macOS で試す</td><td>素の Mach-O ではイベントが来ない。<code>dist/Runner.app</code> を実行する</td></tr>
   <tr><td>WSLg で起動したい</td><td><code>env -u WAYLAND_DISPLAY</code> で明示的に X11 起動（Rust 側にも 1 度だけの再試行フォールバックあり）</td></tr>
 </table>
 

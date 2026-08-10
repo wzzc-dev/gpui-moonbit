@@ -183,7 +183,7 @@ pub fn build_tree(view : Int) -> Result[Unit, Int] {
 }
 ```
 
-利用可能なコマンド: `div` / `text` / `text_input` / `set_size` / `set_bg` / `set_flex_row` / `set_flex_col` / `set_center` / `set_gap` / `set_rounded` / `set_on_click` / `set_key` / `set_padding` / `set_border` / `add_child` / `set_root`。色成分は 0–255 にクランプされます。テキストは内部で UTF-8 にエンコードされ、明示長で送られます（NUL 終端なし）。繰り返し現れる部分木は**コンポーネント**（`button(cb, props)` / `text_input(cb, props)` など、`components.mbt`）として切り出せます。コンポーネントは `CommandBuffer` に部分木を書き、ルートはスタックに残るので、呼び出し側が `add_child()` で接続します。
+利用可能なコマンド: `div` / `text` / `text_input` / `set_size` / `set_bg` / `set_flex_row` / `set_flex_col` / `set_center` / `set_gap` / `set_rounded` / `set_on_click` / `set_key` / `set_scroll_id` / `set_padding` / `set_border` / `add_child` / `set_root`。色成分は 0–255 にクランプされます。テキストは内部で UTF-8 にエンコードされ、明示長で送られます（NUL 終端なし）。繰り返し現れる部分木は**コンポーネント**（`button(cb, props)` / `text_input(cb, props)` など、`components.mbt`）として切り出せます。コンポーネントは `CommandBuffer` に部分木を書き、ルートはスタックに残るので、呼び出し側が `add_child()` で接続します。
 
 **色の渡し方**: alpha 付きの `Color` を取る API（`set_bg_color` / `set_text_color` / `set_shadow` / `set_border_color`）を推奨します。生の `r, g, b` トリプレットを取る `set_bg` / `set_border` / `text` も引き続き利用可能で、wire format は同一です（issue #81 で整合化）。`Color` は `Color::rgb(r, g, b)` / `Color::rgba(r, g, b, a)` で作ります。
 
@@ -270,14 +270,14 @@ pub fn dispatch(
 
 ### 4. イベントを受け取る（callback 契約）
 
-Rust からのイベントは、パッケージ `app` の関数 `dispatch` に固定の 5×i32 envelope で届きます。これは ABI 契約であり、パッケージ名と関数名は変えません。実体は `framework_dispatch` への 1 行委譲です。
+Rust からのイベントは、**ライブラリ所有**のエントリポイント `dispatch_entry`（ルートパッケージ `nakake/gpui-bindings`）に固定の 5×i32 envelope で届きます（RFC 0004）。Rust がリンクする ABI 契約はこの 1 本に固定されており、アプリ側の関数名・パッケージ名は自由です。アプリは起動時（`run_window` より前・メインスレッド）に `register_dispatch(dispatch)` で自分の dispatch を登録し、`dispatch_entry` がそれへ委譲します。再登録は last-wins で、未登録のままイベントが届くと `0`（変化なし）を返して初回だけ警告を 1 行出します。登録する関数のシグネチャは次のとおりで、実体は `framework_dispatch` への 1 行委譲です。
 
 ```moonbit nocheck
-pub fn dispatch(version : Int, kind : Int, view : Int, data_a : Int, data_b : Int) -> Int
+fn dispatch(version : Int, kind : Int, view : Int, data_a : Int, data_b : Int) -> Int
 ```
 
 - slot 0 `version`: 常に `ABI_VERSION`（現在は `4`）。不一致なら `framework_dispatch` がハンドラを実行せず `0` を返して古い Rust バイナリを拒否します
-- slot 1 `kind`: イベント種別（`EVENT_CLICK` = 1、`EVENT_KEY` = 2、`EVENT_TEXT` = 3、`EVENT_NAMED_KEY` = 4、`EVENT_ASYNC` = 5、`EVENT_INPUT_CHANGED` = 6、`EVENT_INPUT_SUBMIT` = 7）
+- slot 1 `kind`: イベント種別（`EVENT_CLICK` = 1、`EVENT_KEY` = 2、`EVENT_TEXT` = 3、`EVENT_NAMED_KEY` = 4、`EVENT_ASYNC` = 5、`EVENT_INPUT_CHANGED` = 6、`EVENT_INPUT_SUBMIT` = 7、`EVENT_SCROLL` = 8）
 - slot 2 `view`: 再構築対象の view id
 - slot 3–4 `data_a` / `data_b`: 種別依存
   - `EVENT_CLICK`: `data_a` = click_id（`HandlerId` の raw 値）、`data_b` = 0
@@ -286,6 +286,7 @@ pub fn dispatch(version : Int, kind : Int, view : Int, data_a : Int, data_b : In
   - `EVENT_NAMED_KEY`: `data_a` = named_key id（`KEY_ENTER` / `KEY_ESCAPE` / `KEY_UP` …）、`data_b` = modifier bits
   - `EVENT_ASYNC`: `data_a` = token、`data_b` = byte 長（ペイロードは `copy_async_payload` でコピー。RFC 0002 の非同期注入経路）
   - `EVENT_INPUT_CHANGED` / `EVENT_INPUT_SUBMIT`: `data_a` = input_id（`InputId` の raw 値）、`data_b` = 0。ペイロードはなく、現在内容は `input_text(view, input_id)` で pull する（RFC 0003）
+  - `EVENT_SCROLL`: `data_a` = scroll_id（`ScrollId` の raw 値。`new_scroll_id` で発行し `set_scroll_id` でワイヤに書き、`on_scroll` で購読）、`data_b` = 0。ペイロードはなく、現在位置は `scroll_state(view, scroll_id)` で pull する（issue #89）
 
 `dispatch` は状態が変わった場合に `1`、変わらない場合に `0` を返します。`framework_dispatch` は配送の前後で store の dirty を区切り、`set` が 1 度でも起きたときだけ再構築コールバックを呼んで `1` を返します。`1` のときだけ Rust 側が再描画通知（`cx.notify()`）を行います。再構築に失敗しても Rust 側は旧ツリーを保持しているため、dirty に基づき `1` を返して構いません。
 

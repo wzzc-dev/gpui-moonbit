@@ -13,7 +13,7 @@
 - Windows と WSL/Linux は 2026-07-19 に手動検証済み。macOS は 2026-07-23 に再検証済み（`build.sh` のバンドル統合後、ウィンドウ表示と `j`/`k`/`r` キー操作を実機確認）。
 - アクティブな root CI（`.github/workflows/ci.yml`）: ubuntu/macos/windows の 3 OS でコールドビルド・テスト・Rust 単独変更後の再ビルドを自動検証（#33、`0f5ce3b`）。
 
-- 3 本の設計 RFC はいずれも実装済み: [`0001`](rfc/0001-component-model.md) コンポーネントモデルと状態管理（`G11`〜`G14`、#86）、[`0002`](rfc/0002-async-event-injection.md) 非同期イベント注入（#84）、[`0003`](rfc/0003-text-input-ime.md) テキスト入力 widget + IME preedit（`G6`/`G19`、#88）。
+- 4 本の設計 RFC はいずれも実装済み: [`0001`](rfc/0001-component-model.md) コンポーネントモデルと状態管理（`G11`〜`G14`、#86）、[`0002`](rfc/0002-async-event-injection.md) 非同期イベント注入（#84）、[`0003`](rfc/0003-text-input-ime.md) テキスト入力 widget + IME preedit（`G6`/`G19`、#88）、[`0004`](rfc/0004-dispatch-registration.md) dispatch のランタイム登録（#125。registry 消費の残件は #132）。
 
 ### 未完了
 - 安定した利用者向け API と、より広い GPUI surface。
