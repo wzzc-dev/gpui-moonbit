@@ -150,5 +150,11 @@ BUFFER_VERSION = 1
 # Library-owned entry point in the root package `nakake/gpui-bindings`
 # (RFC 0004). The build drivers derive the mangled symbol tail from this name.
 name = "dispatch_entry"
+# MoonBit module that owns the entry point. With `name`, this is everything
+# needed to compute the mangled symbol deterministically, which is what lets
+# `gpui-sys` build without `mb_symbol.txt` (i.e. when consumed from a registry
+# rather than from this checkout). Kept here so build.rs and build.py derive it
+# from one declaration instead of each hardcoding the module path.
+module = "nakake/gpui-bindings"
 params = ["i32", "i32", "i32", "i32", "i32"]
 return = "i32"

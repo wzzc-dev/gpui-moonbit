@@ -50,6 +50,43 @@ fn parse_abi(abi: &str) -> (Vec<(&str, i32)>, HashMap<&str, &str>) {
     (constants, callback)
 }
 
+/// Escape one path component for MoonBit's symbol mangling.
+///
+/// `'_' -> "__"` first, then `'-' -> "_2d"`. The order matters: the other way
+/// round would re-escape the underscore that `_2d` introduces. Mirrors
+/// `escape_mangling_component` in `moonbit-bindings/build.py`.
+fn escape_mangling_component(s: &str) -> String {
+    s.replace('_', "__").replace('-', "_2d")
+}
+
+/// Compute the mangled symbol of the MoonBit callback from its module path and
+/// function name, both declared in `abi.toml`'s `[callback]`.
+///
+/// Scheme: `_M0FP<N><len1><comp1><len2><comp2>…<fnlen><fn>`, where `N` is the
+/// number of module components and every length is that of the *escaped* text.
+/// The callback lives in the module's root package, so no package component
+/// appears. For module `nakake/gpui-bindings` and name `dispatch_entry`:
+///
+///   components: ["nakake", "gpui_2dbindings"]
+///   fn:         "dispatch_entry" -> "dispatch__entry" (15 chars)
+///   -> _M0FP2 6nakake 15gpui_2dbindings 15dispatch__entry
+///   -> _M0FP26nakake15gpui_2dbindings15dispatch__entry
+///
+/// The leading `_` is the ELF symbol prefix; on Mach-O the linker adds the
+/// second one, so `#[link_name]` carries exactly one either way. Mirrors
+/// `compute_callback_symbol` in `moonbit-bindings/build.py` — the two must
+/// agree, which is why both read the same two fields.
+fn mangled_callback_symbol(module: &str, name: &str) -> String {
+    let components: Vec<String> = module.split('/').map(escape_mangling_component).collect();
+    let mut out = format!("_M0FP{}", components.len());
+    for comp in &components {
+        out.push_str(&format!("{}{}", comp.len(), comp));
+    }
+    let function = escape_mangling_component(name);
+    out.push_str(&format!("{}{}", function.len(), function));
+    out
+}
+
 fn main() {
     // --- Shared Rust/MoonBit ABI ---
     println!("cargo:rerun-if-changed=abi.toml");
@@ -67,13 +104,14 @@ fn main() {
         .get("name")
         .unwrap_or_else(|| panic!("missing callback `name` in abi.toml"))
         .trim_matches('"');
-    // The name itself is not used here (the real symbol arrives via
-    // mb_symbol.txt); this is a tripwire for a rename that did not reach the
-    // build drivers, which derive the mangled tail from this same field
-    // (RFC 0004 §3.5).
-    if callback_name != "dispatch_entry" {
-        panic!("abi.toml callback name must be `dispatch_entry`");
-    }
+    // `name` and `module` together determine the mangled symbol this crate
+    // links against, and the build drivers derive the same tail from the same
+    // fields (RFC 0004 §3.5). Nothing is hardcoded against them here: pinning
+    // the name would defeat the point of abi.toml being the single source.
+    let callback_module = callback
+        .get("module")
+        .unwrap_or_else(|| panic!("missing callback `module` in abi.toml"))
+        .trim_matches('"');
     let params = callback
         .get("params")
         .unwrap_or_else(|| panic!("missing callback `params` in abi.toml"))
@@ -93,11 +131,21 @@ fn main() {
     }
 
     // --- Rust -> MoonBit callback symbol ---
-    // `mb_symbol.txt` holds the MoonBit `dispatch_entry` mangled symbol (with the
-    // Mach-O leading underscore already stripped for `#[link_name]`). It is
-    // produced by `build.sh`, which extracts the *real* symbol from MoonBit's
-    // compiled output — so a rename or a toolchain mangling change is tracked
-    // automatically. We generate the `extern` block from it.
+    // The symbol is computed from abi.toml, and `mb_symbol.txt` overrides it
+    // when present.
+    //
+    // The computed value is what makes this crate buildable on its own: since
+    // RFC 0004 the callback is a library-owned entry point whose module path
+    // and name are fixed and declared, so the mangling is deterministic. That
+    // matters for publishing — `mb_symbol.txt` is gitignored and therefore not
+    // part of `cargo package`, so a consumer building this crate from a
+    // registry has nothing to read.
+    //
+    // `mb_symbol.txt` still wins where it exists, because `build.sh` writes the
+    // *real* symbol extracted from MoonBit's compiled output: that tracks a
+    // toolchain mangling change the computation would miss. A disagreement
+    // between the two is exactly that situation, so it is reported rather than
+    // silently accepted.
     println!("cargo:rerun-if-changed=mb_symbol.txt");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_DISPATCH_STUB");
     println!("cargo:rerun-if-env-changed=GPUI_SYS_ALLOW_TEST_DISPATCH_STUB");
@@ -115,17 +163,23 @@ fn main() {
         "unsafe fn mb_dispatch(_version: i32, kind: i32, view: i32, data_a: i32, data_b: i32) -> i32 {\n    crate::dispatch_recorder::record(kind, view, data_a, data_b)\n}\n"
             .to_string()
     } else {
-        let link_name = std::fs::read_to_string("mb_symbol.txt")
+        let computed = mangled_callback_symbol(callback_module, callback_name);
+        let extracted = std::fs::read_to_string("mb_symbol.txt")
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        if link_name.is_empty() {
-            panic!(
-                "gpui-sys/mb_symbol.txt is missing or empty.\n\
-                 The MoonBit callback symbol is injected at build time — run `./build.sh`\n\
-                 (which extracts dispatch_entry and writes mb_symbol.txt) instead of a bare\n\
-                 `cargo build`."
-            );
-        }
+        let link_name = if extracted.is_empty() {
+            computed
+        } else {
+            if extracted != computed {
+                println!(
+                    "cargo:warning=mb_symbol.txt ({extracted}) disagrees with the symbol \
+                     computed from abi.toml ({computed}); using mb_symbol.txt. Either the \
+                     MoonBit toolchain changed its mangling, or [callback] name/module in \
+                     abi.toml is stale."
+                );
+            }
+            extracted
+        };
         // This declaration is generated only after validating the fixed-width
         // callback signature from abi.toml above. The five i32 slots carry the
         // versioned event envelope: (abi_version, event_kind, view, data_a, data_b).

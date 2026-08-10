@@ -61,8 +61,9 @@ def compute_callback_symbol(abi_toml):
 
     The callback lives in the module's root package (nakake/gpui-bindings),
     so no package component is mangled into the symbol; only the module parts
-    and the function name appear. The function name comes from gpui-sys/abi.toml's
-    `[callback] name`, the single source of truth (RFC 0004).
+    and the function name appear. Both the function name and the module come
+    from gpui-sys/abi.toml's `[callback]`, the single source of truth (RFC 0004);
+    `gpui-sys/build.rs` computes the same value from the same two fields.
 
     Mangling scheme: _M0FP<N><len1><comp1><len2><comp2>...<fnlen><fn>
     where N = number of path components (module parts only).
@@ -79,7 +80,7 @@ def compute_callback_symbol(abi_toml):
     """
     function = read_callback_name(abi_toml)
 
-    module_parts = ["nakake", "gpui-bindings"]
+    module_parts = read_callback_module(abi_toml).split("/")
     components = [escape_mangling_component(p) for p in module_parts]
     fn = escape_mangling_component(function)
 
@@ -93,8 +94,12 @@ def compute_callback_symbol(abi_toml):
     return "_M0FP" + "".join(parts)
 
 
-def read_callback_name(abi_toml):
-    """Extract `[callback] name` from gpui-sys/abi.toml. Exits on error."""
+def read_callback_field(abi_toml, key, pattern):
+    """Extract a string field from `[callback]` in gpui-sys/abi.toml.
+
+    `pattern` validates the value; a value that does not match is an error
+    rather than something to mangle blindly. Exits on error.
+    """
     with open(abi_toml) as f:
         lines = f.read().splitlines()
     in_callback = False
@@ -107,15 +112,32 @@ def read_callback_name(abi_toml):
             continue
         if not in_callback:
             continue
-        m = re.match(r"^name\s*=\s*\"([^\"]*)\"\s*$", line)
+        m = re.match(rf"^{key}\s*=\s*\"([^\"]*)\"\s*$", line)
         if m:
-            name = m.group(1)
-            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
-                log(f"ERROR: invalid [callback] name in abi.toml: {name}")
+            value = m.group(1)
+            if not re.match(pattern, value):
+                log(f"ERROR: invalid [callback] {key} in abi.toml: {value}")
                 sys.exit(1)
-            return name
-    log(f"ERROR: could not derive [callback] name from {abi_toml}")
+            return value
+    log(f"ERROR: could not derive [callback] {key} from {abi_toml}")
     sys.exit(1)
+
+
+def read_callback_name(abi_toml):
+    """Extract `[callback] name` from gpui-sys/abi.toml. Exits on error."""
+    return read_callback_field(abi_toml, "name", r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def read_callback_module(abi_toml):
+    """Extract `[callback] module` from gpui-sys/abi.toml. Exits on error.
+
+    The owning MoonBit module (`nakake/gpui-bindings`). Declared in abi.toml so
+    this script and `gpui-sys/build.rs` derive the mangled symbol from one
+    place instead of each hardcoding the module path.
+    """
+    return read_callback_field(
+        abi_toml, "module", r"^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$"
+    )
 
 
 def normalize_native_libs(native_libs_str, os_pkg):

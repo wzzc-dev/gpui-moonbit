@@ -98,6 +98,35 @@ pub fn register_dispatch(f : (Int, Int, Int, Int, Int) -> Int) -> Unit
 2. **DCE リンクテスト**: §3.4(consumer で `_keep` なしリンク)。
 3. **registry 依存スパイク(並行)**: 0.0.x を mooncakes へ試験公開し、`.mooncakes/` にフェッチされた依存でも prebuild(`--moonbit-unstable-prebuild`)が走るかを確認する。実績は path 依存のみのため、公開段階で設計に跳ね返る前に潰す。結果は本 RFC に追記する。
 
+### 6-3 の結果(2026-08-06)
+
+**試験公開の前に、公開しても動かないことが判明した**ため、公開せずに構造の可否を先に検証した。
+
+**ブロッカー**: `moonbit-bindings/build.py` は Rust ソースを `<module_root>/../gpui-sys` に探す。mooncakes 経由だとモジュールは `.mooncakes/nakake/gpui-bindings/` に展開され、その親に `gpui-sys` は無い(`.linux-libs` も同様)。したがって「MoonBit モジュールだけを公開する」形は成立しない。
+
+検討した 3 案のうち **C(crates.io 経由)** を採る:
+
+| 案 | 中身 | 判断 |
+|---|---|---|
+| A | `include` でモジュール外の `gpui-sys/` を同梱 | moon が module_root 外を含められるか不明。tarball も肥大 |
+| B | `gpui-sys/` を `moonbit-bindings/` 配下へ移す | リポジトリ構造の大手術。build.sh / CI / 本 RFC に波及 |
+| **C** | `gpui-sys` を crates.io に公開し、同梱の wrapper crate から引く | **採用**。既存のディレクトリ構造を変えない |
+
+**C の技術的前提を実測で確認した**(Linux x86_64):
+
+- `crate-type = ["staticlib"]` の wrapper crate に `extern crate gpui_sys;` の 1 行を書くだけで、依存 rlib の `#[no_mangle]` エクスポート 11 個が**すべて staticlib に残る**。`-C link-dead-code` も re-export も不要だった。MoonBit callback への未解決参照も直接ビルドと同一
+- end-to-end も通る。`build.py` の `-lgpui_sys` を `-lgpui_sys_wrapper` に差し替えて `tests/consumer` をビルド・実行 → PASS(イベント注入 8 ステップ含む)
+- 依存の形(path / crates.io)はコード生成とリンクに影響しないので、path 依存での実測で足りる
+- `gpui-sys` は git 依存を持たない(`gpui = "0.2"` 等すべて registry)ため crates.io 公開が可能。名前も空き。`gpui` 本体は 0.2.2 が公開済み
+
+**publish 前に必要と判明した修正**(本 RFC の範囲で実施):
+
+1. `mb_symbol.txt` は `.gitignore` にあり `cargo package` に含まれない。一方 `build.rs` はそれを必須として `panic!` していたため、公開クレートは消費者環境で即死する。→ §3.5 でシンボルが固定・決定的になったことを使い、`abi.toml` の `[callback]` から `build.rs` が**自分で計算して既定値にする**。`mb_symbol.txt` は「必須」から「`build.sh` 用の上書き」へ降格。両者が食い違ったときは `cargo:warning` で報告する(ハードコードしていた name ガードの tripwire を、より正確な形で置き換え)
+2. `gpui-sys/Cargo.toml` に crates.io 必須の `description` / `license` が無かった → 追加
+3. モジュールパスの導出元として `abi.toml` の `[callback]` に `module` を追加。`build.rs` と `build.py` が各自ハードコードせず 1 箇所から導く
+
+**残件**: `build.py` を registry 消費に対応させる(wrapper crate の生成と置き場所)のは build driver の再設計であり、`gpui-sys` を publish するまで end-to-end 検証もできないため**別 issue**とする。#126(cmd の prebuild 方式への再設計)と範囲が重なるので、そちらと合わせて設計する。macOS / Windows も未検証。
+
 ## 7. 実装計画(#125 のスコープ)
 
 1. `dispatch_entry` / `register_dispatch` + 未登録 no-op + 警告(トップレベルパッケージ)。
@@ -112,6 +141,6 @@ pub fn register_dispatch(f : (Int, Int, Int, Int, Int) -> Int) -> Unit
 ## 8. 未決事項
 
 1. ~~**警告の文言と出力先**~~ 解決(§3.3): MoonBit から stderr へ書く手段が無いため stdout(`println`)1 行、初回のみ。文言は `[gpui-bindings] warning: no dispatch registered; …`。
-2. **suffix の具体値**: `dispatch_entry` のマングル名はトップレベルパッケージの segment 構成に依存する。抽出時に確定し、`abi.toml` からの導出式を build.sh / build.ps1 で共通化する。
+2. ~~**suffix の具体値**~~ 解決: `_M0FP26nakake15gpui_2dbindings15dispatch__entry`(2026-08-06 実測)。導出元は `abi.toml` の `[callback]` の `name` と `module` に一本化され、build.sh / build.ps1 は suffix を、build.py と `gpui-sys/build.rs` は完全なシンボルを、いずれもそこから導く。
 3. **`_keep` 撤廃の成否**(§3.4): 検証結果で README の消費者手順が変わる。
 4. **cmd 再設計 issue の起票内容**: §4 のとおり別 issue(このリポジトリの issue トラッカー参照)。

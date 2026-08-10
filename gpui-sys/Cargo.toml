@@ -2,6 +2,14 @@
 name = "gpui-sys"
 version = "0.1.0"
 edition = "2024"
+# crates.io rejects a publish without `description` and `license`; the values
+# mirror `moonbit-bindings/moon.mod` so the two halves of the bridge stay
+# consistent (docs/versioning.md keeps their versions in lockstep).
+description = "C ABI staticlib exposing Zed's GPUI to MoonBit: retained node tree, rendering, and the event callback bridge."
+license = "Apache-2.0"
+repository = "https://github.com/nakake/gpui-moonbit"
+keywords = ["gpui", "moonbit", "ffi", "gui", "native"]
+categories = ["gui", "external-ffi-bindings"]
 
 [features]
 # Unit-test-only callback replacement; build.rs also requires the explicit
