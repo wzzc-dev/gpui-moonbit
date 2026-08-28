@@ -2014,7 +2014,9 @@ struct WindowBenchmark {
     started: std::time::Instant,
     previous_frame: Option<std::time::Instant>,
     action_started: Option<std::time::Instant>,
+    pending_work_ms: f64,
     first_interactive_ms: f64,
+    work_samples: Vec<f64>,
     samples: Vec<f64>,
     latencies: Vec<f64>,
     completed: usize,
@@ -2050,7 +2052,9 @@ pub extern "C" fn gpui_run_window_benchmark(
             started: std::time::Instant::now(),
             previous_frame: None,
             action_started: None,
+            pending_work_ms: 0.0,
             first_interactive_ms: 0.0,
+            work_samples: Vec::new(),
             samples: Vec::new(),
             latencies: Vec::new(),
             completed: 0,
@@ -2124,19 +2128,20 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
         if st.previous_frame.is_none() {
             st.first_interactive_ms = benchmark_milliseconds(st.started, now);
             if st.scenario == 0 {
-                st.samples.push(st.first_interactive_ms);
-                report = Some(benchmark_report_json(&st));
+                st.work_samples.push(0.0);
+                report = Some(benchmark_report_json_v2(&st));
             }
         } else if st.warming_up {
             st.warming_up = false;
         } else {
             let previous = st.previous_frame.expect("previous frame");
             st.samples.push(benchmark_milliseconds(previous, now));
+            st.work_samples.push(st.pending_work_ms);
             let action = st.action_started.expect("action start");
             st.latencies.push(benchmark_milliseconds(action, now));
             st.completed += 1;
             if st.completed >= st.target {
-                report = Some(benchmark_report_json(&st));
+                report = Some(benchmark_report_json_v2(&st));
             }
         }
         if report.is_none() {
@@ -2151,6 +2156,7 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
             // view entity again (GPUI forbids re-entrant updates).
             if let Some(view_entity) = entity.upgrade() {
                 let view = view_entity.read(cx);
+                let work_started = std::time::Instant::now();
                 benchmark_drive_action(
                     view.inputs.clone(),
                     view.scroll_handles.clone(),
@@ -2164,6 +2170,10 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
                 // native scroll offsets are already owned by GPUI and should
                 // remain a compositor/layout-only update. Rebuilding all
                 // blocks here makes the stress fixture quadratic in practice.
+                let pending_work_ms = benchmark_milliseconds(work_started, std::time::Instant::now());
+                if let Some(state) = WINDOW_BENCHMARK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    state.pending_work_ms = pending_work_ms;
+                }
                 if scenario != 2 {
                     let _ = view_entity.update(cx, |_, cx| cx.notify());
                 }
@@ -2191,48 +2201,33 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
     cx.quit();
 }
 
-fn benchmark_report_json(st: &WindowBenchmark) -> String {
-    let mut sorted = st.samples.clone();
-    sorted.sort_by(f64::total_cmp);
-    let mean = st.samples.iter().sum::<f64>() / st.samples.len() as f64;
-    let percentile = |ratio: f64| sorted[((sorted.len() - 1) as f64 * ratio).round() as usize];
-    let dropped = st.samples.iter().filter(|value| **value > 16.667).count();
-    let scenario = match st.scenario {
-        0 => "open",
-        1 => "input",
-        _ => "scroll",
-    };
-    let samples = st
-        .samples
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    // Input latency is only defined for the input scenario. Keep the field
-    // present for a stable schema, but do not expose action-to-frame samples
-    // for open/scroll rows where the protocol requires an empty list.
-    let latencies = if st.scenario == 1 {
-        st.latencies
-            .iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    } else {
-        String::new()
-    };
-    let input_latency = if st.scenario == 1 {
-        let total: f64 = st.latencies.iter().sum();
-        format!("{}", total / st.latencies.len() as f64)
-    } else {
-        "null".to_string()
-    };
+fn benchmark_report_json_v2(st: &WindowBenchmark) -> String {
+    let mut work = st.work_samples.clone();
+    let mut intervals = st.samples.clone();
+    work.sort_by(f64::total_cmp);
+    intervals.sort_by(f64::total_cmp);
+    let average = |values: &[f64]| values.iter().sum::<f64>() / values.len().max(1) as f64;
+    let at = |values: &[f64], ratio: f64| values[((values.len().saturating_sub(1)) as f64 * ratio).round() as usize];
+    let dropped: usize = st.samples.iter().map(|value| {
+        ((*value / 16.667).ceil() as usize).saturating_sub(1)
+    }).sum();
+    let scenario = match st.scenario { 0 => "open", 1 => "input", _ => "scroll" };
+    let encode = |values: &[f64]| values.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(",");
+    let input_samples = if st.scenario == 1 { encode(&st.latencies) } else { String::new() };
+    let input_mean = if st.scenario == 1 { average(&st.latencies) } else { 0.0 };
     format!(
-        "{{\"adapter\":\"gpui\",\"measurement_scope\":\"ui-frame\",\"timing_source\":\"gpui-Window.on_next_frame-interval\",\"latency_source\":\"action-to-Window.on_next_frame\",\"scenario\":\"{scenario}\",\"samples_ms\":[{samples}],\"mean_ms\":{mean},\"p95_ms\":{p95},\"p99_ms\":{p99},\"dropped_frames\":{dropped},\"dropped_frame_rate\":{dropped_rate},\"action_count\":{actions},\"frame_sample_count\":{frames},\"warmup_action_count\":{warmups},\"input_latency_ms\":{input_latency},\"input_latency_samples_ms\":[{latencies}],\"first_interactive_ms\":{first_interactive},\"document_load_ms\":{document_load},\"viewport\":{{\"width\":1280,\"height\":800}}}}",
-        mean = mean,
-        p95 = percentile(0.95),
-        p99 = percentile(0.99),
+        "{{\"adapter\":\"gpui\",\"measurement_scope\":\"ui-frame\",\"timing_source\":\"gpui-on_next_frame-and-action-dispatch\",\"latency_source\":\"action-to-on_next_frame\",\"scenario\":\"{scenario}\",\"frame_work_samples_ms\":[{work}],\"frame_interval_samples_ms\":[{intervals}],\"input_to_visible_samples_ms\":[{input_samples}],\"offscreen_samples_ms\":[{zeros}],\"readback_samples_ms\":[{zeros}],\"offscreen_readback_samples_ms\":[{zeros}],\"frame_work_ms\":{work_mean},\"frame_interval_ms\":{interval_mean},\"input_to_visible_ms\":{input_mean},\"offscreen_ms\":0,\"readback_ms\":0,\"offscreen_readback_ms\":0,\"frame_work_p95_ms\":{work_p95},\"frame_interval_p95_ms\":{interval_p95},\"input_to_visible_p95_ms\":{input_p95},\"dropped_display_frames\":{dropped},\"action_count\":{actions},\"frame_sample_count\":{frames},\"warmup_action_count\":{warmups},\"first_interactive_ms\":{first_interactive},\"document_load_ms\":{document_load},\"viewport\":{{\"width\":1280,\"height\":800}},\"font\":\"system-ui 16px\",\"line_height\":1.55,\"overscan\":3,\"virtual_row_height\":66}}",
+        work = encode(&st.work_samples),
+        intervals = encode(&st.samples),
+        input_samples = input_samples,
+        zeros = encode(&vec![0.0; st.work_samples.len()]),
+        work_mean = average(&st.work_samples),
+        interval_mean = if st.samples.is_empty() { "null".to_string() } else { average(&st.samples).to_string() },
+        input_mean = if st.scenario == 1 { input_mean.to_string() } else { "null".to_string() },
+        work_p95 = at(&work, 0.95),
+        interval_p95 = if intervals.is_empty() { "null".to_string() } else { at(&intervals, 0.95).to_string() },
+        input_p95 = if st.scenario == 1 { at(&st.latencies, 0.95).to_string() } else { "null".to_string() },
         dropped = dropped,
-        dropped_rate = dropped as f64 / st.samples.len() as f64,
         actions = st.target,
         frames = st.samples.len(),
         warmups = if st.scenario == 0 { 0 } else { 1 },
