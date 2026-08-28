@@ -1896,11 +1896,11 @@ pub extern "C" fn gpui_run_window(view: i32, width: f32, height: f32) -> i32 {
         if view < 0 {
             return GPUI_STATUS_INVALID_HANDLE;
         }
-        run_window_with_fallback(view as usize, width, height)
+        run_window_with_fallback(view as usize, width, height, false)
     })
 }
 
-fn run_window(view: usize, width: f32, height: f32) {
+fn run_window(view: usize, width: f32, height: f32, benchmark: bool) {
     Application::new().run(move |cx: &mut App| {
         // Attach a fresh wake channel and start the drain pump before the
         // window opens, so events posted from other threads — including any
@@ -1937,15 +1937,26 @@ fn run_window(view: usize, width: f32, height: f32) {
         // root entity is only reachable through `read_window` (the `root`
         // accessor is test-support-gated), so downgrade inside the closure and
         // register the weak handle.
+        let mut benchmark_entity = None;
         if let Ok(weak) = cx.read_window(&window, |entity, _| entity.downgrade()) {
+            if benchmark {
+                benchmark_entity = Some(weak.clone());
+            }
             register_view(cx, view_id, weak);
+        }
+        // Arm the frame-paced benchmark loop after the window exists so the
+        // first `on_next_frame` tick observes the first presented frame.
+        if let Some(entity) = benchmark_entity {
+            let _ = window.update(cx, |_, window, _| {
+                schedule_benchmark_frame(window, view_id, &entity);
+            });
         }
         cx.activate(true);
     });
 }
 
-fn run_window_with_fallback(view: usize, width: f32, height: f32) -> i32 {
-    match catch_unwind(AssertUnwindSafe(|| run_window(view, width, height))) {
+fn run_window_with_fallback(view: usize, width: f32, height: f32, benchmark: bool) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| run_window(view, width, height, benchmark))) {
         Ok(()) => GPUI_STATUS_OK,
         Err(first_panic) => {
             #[cfg(target_os = "linux")]
@@ -1957,7 +1968,9 @@ fn run_window_with_fallback(view: usize, width: f32, height: f32) -> i32 {
                 // SAFETY: window startup is single-threaded and happens before GPUI
                 // creates worker threads that could concurrently read the environment.
                 unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
-                return match catch_unwind(AssertUnwindSafe(|| run_window(view, width, height))) {
+                return match catch_unwind(AssertUnwindSafe(|| {
+                    run_window(view, width, height, benchmark)
+                })) {
                     Ok(()) => GPUI_STATUS_OK,
                     Err(second_panic) => {
                         report_panic("gpui_run_window (X11 retry)", second_panic.as_ref());
@@ -1970,6 +1983,262 @@ fn run_window_with_fallback(view: usize, width: f32, height: f32) -> i32 {
             GPUI_STATUS_INTERNAL_PANIC
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Real-window UI benchmark (ui-frame scope)
+//
+// Frame-paced benchmark loop for the cross-editor comparison harness,
+// mirroring the retired Rust editor adapter: every `on_next_frame` tick
+// records the interval since the previous frame, drives ONE action through
+// the real input/scroll path, and quits once the target action count is
+// reached. Scenario codes:
+//   0 (open):   sample the first presented frame as first_interactive and quit.
+//   1 (input):  append one ASCII char to every retained input model via the
+//               same commit path real typing uses (apply + mirror +
+//               EVENT_INPUT_CHANGED), so MoonBit rebuilds and recommits the
+//               tree before the next frame renders it.
+//   2 (scroll): add +/- `stride` px to every retained scroll handle — the
+//               native wheel equivalent; paint clamps the offset and the
+//               EVENT_SCROLL announcement fires as it would for a user.
+// Frames are the vsync-paced GPUI frames, so sample intervals are real frame
+// durations, not action pacing. The JSON report is printed to stdout just
+// before quitting, because on macOS quitting terminates the process without
+// unwinding `gpui_run_window_benchmark`.
+
+struct WindowBenchmark {
+    scenario: i32,
+    target: usize,
+    stride: f32,
+    document_load_ms: f64,
+    started: std::time::Instant,
+    previous_frame: Option<std::time::Instant>,
+    action_started: Option<std::time::Instant>,
+    first_interactive_ms: f64,
+    samples: Vec<f64>,
+    latencies: Vec<f64>,
+    completed: usize,
+    warming_up: bool,
+    action_index: usize,
+}
+
+static WINDOW_BENCHMARK: Mutex<Option<WindowBenchmark>> = Mutex::new(None);
+
+fn benchmark_milliseconds(started: std::time::Instant, finished: std::time::Instant) -> f64 {
+    finished.duration_since(started).as_secs_f64() * 1000.0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_run_window_benchmark(
+    view: i32,
+    width: f32,
+    height: f32,
+    scenario: i32,
+    target: i32,
+    stride: f32,
+    document_load_ms: f64,
+) -> i32 {
+    ffi_export("gpui_run_window_benchmark", || {
+        if view < 0 || !(0..=2).contains(&scenario) || target <= 0 {
+            return GPUI_STATUS_INVALID_HANDLE;
+        }
+        *WINDOW_BENCHMARK.lock().unwrap_or_else(|e| e.into_inner()) = Some(WindowBenchmark {
+            scenario,
+            target: target as usize,
+            stride,
+            document_load_ms,
+            started: std::time::Instant::now(),
+            previous_frame: None,
+            action_started: None,
+            first_interactive_ms: 0.0,
+            samples: Vec::new(),
+            latencies: Vec::new(),
+            completed: 0,
+            warming_up: scenario != 0,
+            action_index: 0,
+        });
+        run_window_with_fallback(view as usize, width, height, true)
+    })
+}
+
+fn schedule_benchmark_frame(window: &mut Window, view: i32, entity: &WeakEntity<FfiView>) {
+    let entity = entity.clone();
+    window.on_next_frame(move |window, cx| {
+        benchmark_frame_tick(window, cx, view, &entity);
+    });
+}
+
+fn benchmark_drive_action(
+    inputs: Rc<RefCell<HashMap<i32, Entity<TextInputModel>>>>,
+    scroll_handles: Rc<RefCell<HashMap<String, ScrollHandle>>>,
+    window: &mut Window,
+    cx: &mut App,
+    scenario: i32,
+    index: usize,
+    stride: f32,
+) {
+    match scenario {
+        // Append one char through the same commit path real typing uses:
+        // apply to the model, refresh the mirror, emit EVENT_INPUT_CHANGED so
+        // MoonBit pulls the text, rebuilds and recommits the tree.
+        1 => {
+            let models: Vec<Entity<TextInputModel>> =
+                inputs.borrow().values().cloned().collect();
+            for model in models {
+                model.update(cx, |m, cx| {
+                    let ch = char::from(b'a' + (index % 26) as u8);
+                    let start = m.content.len();
+                    input_apply_replace(
+                        &mut m.content,
+                        &mut m.selected_range,
+                        &mut m.marked_range,
+                        start..start,
+                        &ch.to_string(),
+                    );
+                    m.sync_mirror();
+                    m.emit_changed(window, cx);
+                });
+            }
+        }
+        // Native wheel equivalent: shift every retained scroll handle (the
+        // document-scroll div is the only one in this app). Alternating
+        // directions match the wheel deltas the other adapters send; paint
+        // clamps the offset to the content bounds exactly as for a user.
+        2 => {
+            for handle in scroll_handles.borrow_mut().values_mut() {
+                let mut offset = handle.offset();
+                offset.y += px(if index % 2 == 0 { -stride } else { stride });
+                handle.set_offset(offset);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &WeakEntity<FfiView>) {
+    let now = std::time::Instant::now();
+    let mut report = None;
+    {
+        let mut guard = WINDOW_BENCHMARK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(st) = guard.as_mut() else { return };
+        if st.previous_frame.is_none() {
+            st.first_interactive_ms = benchmark_milliseconds(st.started, now);
+            if st.scenario == 0 {
+                st.samples.push(st.first_interactive_ms);
+                report = Some(benchmark_report_json(&st));
+            }
+        } else if st.warming_up {
+            st.warming_up = false;
+        } else {
+            let previous = st.previous_frame.expect("previous frame");
+            st.samples.push(benchmark_milliseconds(previous, now));
+            let action = st.action_started.expect("action start");
+            st.latencies.push(benchmark_milliseconds(action, now));
+            st.completed += 1;
+            if st.completed >= st.target {
+                report = Some(benchmark_report_json(&st));
+            }
+        }
+        if report.is_none() {
+            st.previous_frame = Some(now);
+            st.action_started = Some(std::time::Instant::now());
+            let (scenario, index, stride) = (st.scenario, st.action_index, st.stride);
+            st.action_index += 1;
+            drop(guard);
+            // Clone the shared handle maps out of the view state so actions
+            // run OUTSIDE a `FfiView` update: the input commit path notifies
+            // MoonBit synchronously, and the notification handler updates the
+            // view entity again (GPUI forbids re-entrant updates).
+            if let Some(view_entity) = entity.upgrade() {
+                let view = view_entity.read(cx);
+                benchmark_drive_action(
+                    view.inputs.clone(),
+                    view.scroll_handles.clone(),
+                    window,
+                    cx,
+                    scenario,
+                    index,
+                    stride,
+                );
+                // Input changes need MoonBit to rebuild the formatted tree;
+                // native scroll offsets are already owned by GPUI and should
+                // remain a compositor/layout-only update. Rebuilding all
+                // blocks here makes the stress fixture quadratic in practice.
+                if scenario != 2 {
+                    let _ = view_entity.update(cx, |_, cx| cx.notify());
+                }
+            }
+            // `on_next_frame` callbacks only run when GPUI schedules another
+            // draw. ScrollHandle changes can settle without invalidating the
+            // window (notably on large documents), so request the next frame
+            // explicitly before arming the callback.
+            schedule_benchmark_frame(window, view, entity);
+            window.refresh();
+            return;
+        }
+        *guard = None;
+    }
+    // The report must reach stdout before quitting: on macOS `quit`
+    // terminates the process through [NSApp terminate:], so
+    // `Application::run` never unwinds back into MoonBit.
+    {
+        use std::io::Write;
+        let report_text = report.as_deref().unwrap_or("");
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{report_text}");
+        let _ = out.flush();
+    }
+    cx.quit();
+}
+
+fn benchmark_report_json(st: &WindowBenchmark) -> String {
+    let mut sorted = st.samples.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mean = st.samples.iter().sum::<f64>() / st.samples.len() as f64;
+    let percentile = |ratio: f64| sorted[((sorted.len() - 1) as f64 * ratio).round() as usize];
+    let dropped = st.samples.iter().filter(|value| **value > 16.667).count();
+    let scenario = match st.scenario {
+        0 => "open",
+        1 => "input",
+        _ => "scroll",
+    };
+    let samples = st
+        .samples
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Input latency is only defined for the input scenario. Keep the field
+    // present for a stable schema, but do not expose action-to-frame samples
+    // for open/scroll rows where the protocol requires an empty list.
+    let latencies = if st.scenario == 1 {
+        st.latencies
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        String::new()
+    };
+    let input_latency = if st.scenario == 1 {
+        let total: f64 = st.latencies.iter().sum();
+        format!("{}", total / st.latencies.len() as f64)
+    } else {
+        "null".to_string()
+    };
+    format!(
+        "{{\"adapter\":\"gpui\",\"measurement_scope\":\"ui-frame\",\"timing_source\":\"gpui-Window.on_next_frame-interval\",\"latency_source\":\"action-to-Window.on_next_frame\",\"scenario\":\"{scenario}\",\"samples_ms\":[{samples}],\"mean_ms\":{mean},\"p95_ms\":{p95},\"p99_ms\":{p99},\"dropped_frames\":{dropped},\"dropped_frame_rate\":{dropped_rate},\"action_count\":{actions},\"frame_sample_count\":{frames},\"warmup_action_count\":{warmups},\"input_latency_ms\":{input_latency},\"input_latency_samples_ms\":[{latencies}],\"first_interactive_ms\":{first_interactive},\"document_load_ms\":{document_load},\"viewport\":{{\"width\":1280,\"height\":800}}}}",
+        mean = mean,
+        p95 = percentile(0.95),
+        p99 = percentile(0.99),
+        dropped = dropped,
+        dropped_rate = dropped as f64 / st.samples.len() as f64,
+        actions = st.target,
+        frames = st.samples.len(),
+        warmups = if st.scenario == 0 { 0 } else { 1 },
+        first_interactive = st.first_interactive_ms,
+        document_load = st.document_load_ms,
+    )
 }
 
 // ---------------------------------------------------------------------------

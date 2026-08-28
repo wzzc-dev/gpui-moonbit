@@ -226,6 +226,14 @@ int32_t gpui_update_text(int32_t view,
  */
 int32_t gpui_run_window(int32_t view, float width, float height);
 
+int32_t gpui_run_window_benchmark(int32_t view,
+                                  float width,
+                                  float height,
+                                  int32_t scenario,
+                                  int32_t target,
+                                  float stride,
+                                  double document_load_ms);
+
 /**
  * UTF-8 byte length of the committed content of `(view, input_id)`, for
  * buffer sizing before `gpui_input_copy_text`. Main-thread contract, same as

@@ -1,0 +1,505 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "nakake/gpui-bindings"
+
+import {
+  "moonbitlang/core/buffer",
+  "moonbitlang/core/ref",
+}
+
+// Values
+pub const ABI_VERSION : Int = 4
+
+pub const ALIGN_CENTER : Int = 2
+
+pub const ALIGN_DEFAULT : Int = 0
+
+pub const ALIGN_END : Int = 3
+
+pub const ALIGN_START : Int = 1
+
+pub const ALIGN_STRETCH : Int = 4
+
+pub const BUFFER_VERSION : Int = 1
+
+pub const CURSOR_ARROW : Int = 0
+
+pub const CURSOR_COL_RESIZE : Int = 9
+
+pub const CURSOR_CROSSHAIR : Int = 3
+
+pub const CURSOR_EW_RESIZE : Int = 7
+
+pub const CURSOR_GRAB : Int = 4
+
+pub const CURSOR_GRABBING : Int = 5
+
+pub const CURSOR_NONE : Int = 11
+
+pub const CURSOR_NOT_ALLOWED : Int = 6
+
+pub const CURSOR_NS_RESIZE : Int = 8
+
+pub const CURSOR_POINTER : Int = 1
+
+pub const CURSOR_ROW_RESIZE : Int = 10
+
+pub const CURSOR_TEXT : Int = 2
+
+pub const EVENT_ASYNC : Int = 5
+
+pub const EVENT_CLICK : Int = 1
+
+pub const EVENT_INPUT_CHANGED : Int = 6
+
+pub const EVENT_INPUT_SUBMIT : Int = 7
+
+pub const EVENT_KEY : Int = 2
+
+pub const EVENT_NAMED_KEY : Int = 4
+
+pub const EVENT_SCROLL : Int = 8
+
+pub const EVENT_TEXT : Int = 3
+
+pub const JUSTIFY_CENTER : Int = 2
+
+pub const JUSTIFY_DEFAULT : Int = 0
+
+pub const JUSTIFY_END : Int = 3
+
+pub const JUSTIFY_SPACE_AROUND : Int = 5
+
+pub const JUSTIFY_SPACE_BETWEEN : Int = 4
+
+pub const JUSTIFY_START : Int = 1
+
+pub const KEY_BACKSPACE : Int = 8
+
+pub const KEY_DELETE : Int = 9
+
+pub const KEY_DOWN : Int = 4
+
+pub const KEY_END : Int = 11
+
+pub const KEY_ENTER : Int = 1
+
+pub const KEY_ESCAPE : Int = 2
+
+pub const KEY_HOME : Int = 10
+
+pub const KEY_LEFT : Int = 5
+
+pub const KEY_PAGEDOWN : Int = 13
+
+pub const KEY_PAGEUP : Int = 12
+
+pub const KEY_RIGHT : Int = 6
+
+pub const KEY_TAB : Int = 7
+
+pub const KEY_UP : Int = 3
+
+pub const MOD_ALT : Int = 2
+
+pub const MOD_CTRL : Int = 1
+
+pub const MOD_FUNCTION : Int = 16
+
+pub const MOD_PLATFORM : Int = 8
+
+pub const MOD_SHIFT : Int = 4
+
+pub const OP_ADD_CHILD : Int = 11
+
+pub const OP_DIV : Int = 1
+
+pub const OP_SET_ALIGN : Int = 20
+
+pub const OP_SET_BG : Int = 4
+
+pub const OP_SET_BG_COLOR : Int = 15
+
+pub const OP_SET_BORDER : Int = 14
+
+pub const OP_SET_CENTER : Int = 6
+
+pub const OP_SET_CURSOR : Int = 24
+
+pub const OP_SET_FLEX : Int = 5
+
+pub const OP_SET_FLEX_ITEM : Int = 19
+
+pub const OP_SET_FOCUSABLE : Int = 35
+
+pub const OP_SET_FONT_FAMILY : Int = 34
+
+pub const OP_SET_FONT_WEIGHT : Int = 30
+
+pub const OP_SET_GAP : Int = 7
+
+pub const OP_SET_INSET : Int = 26
+
+pub const OP_SET_KEY : Int = 10
+
+pub const OP_SET_LINE_HEIGHT : Int = 31
+
+pub const OP_SET_MARGIN : Int = 16
+
+pub const OP_SET_MAX_SIZE : Int = 18
+
+pub const OP_SET_MIN_SIZE : Int = 17
+
+pub const OP_SET_ON_CLICK : Int = 9
+
+pub const OP_SET_OPACITY : Int = 22
+
+pub const OP_SET_OVERFLOW : Int = 21
+
+pub const OP_SET_PADDING : Int = 13
+
+pub const OP_SET_PADDING_SIDES : Int = 27
+
+pub const OP_SET_POSITION : Int = 25
+
+pub const OP_SET_ROOT : Int = 12
+
+pub const OP_SET_ROUNDED : Int = 8
+
+pub const OP_SET_SCROLL_ID : Int = 40
+
+pub const OP_SET_SHADOW : Int = 23
+
+pub const OP_SET_SIZE : Int = 3
+
+pub const OP_SET_TAB_INDEX : Int = 36
+
+pub const OP_SET_TAB_STOP : Int = 37
+
+pub const OP_SET_TEXT_ALIGN : Int = 32
+
+pub const OP_SET_TEXT_COLOR : Int = 29
+
+pub const OP_SET_TEXT_SIZE : Int = 28
+
+pub const OP_SET_WHITESPACE : Int = 33
+
+pub const OP_TEXT : Int = 2
+
+pub const OP_TEXT_INPUT : Int = 38
+
+pub const OP_TEXT_RUN : Int = 39
+
+pub const OVERFLOW_HIDDEN : Int = 1
+
+pub const OVERFLOW_SCROLL : Int = 2
+
+pub const OVERFLOW_VISIBLE : Int = 0
+
+pub const POSITION_ABSOLUTE : Int = 1
+
+pub const POSITION_RELATIVE : Int = 0
+
+pub const RUN_STYLE_BACKGROUND : Int = 32
+
+pub const RUN_STYLE_COLOR : Int = 1
+
+pub const RUN_STYLE_ITALIC : Int = 4
+
+pub const RUN_STYLE_STRIKETHROUGH : Int = 16
+
+pub const RUN_STYLE_UNDERLINE : Int = 8
+
+pub const RUN_STYLE_WEIGHT : Int = 2
+
+pub const TEXT_ALIGN_CENTER : Int = 2
+
+pub const TEXT_ALIGN_DEFAULT : Int = 0
+
+pub const TEXT_ALIGN_JUSTIFY : Int = 4
+
+pub const TEXT_ALIGN_LEFT : Int = 1
+
+pub const TEXT_ALIGN_RIGHT : Int = 3
+
+pub const WHITESPACE_DEFAULT : Int = 0
+
+pub const WHITESPACE_NORMAL : Int = 1
+
+pub const WHITESPACE_NOWRAP : Int = 2
+
+pub const WHITESPACE_PRE : Int = 3
+
+pub const WHITESPACE_PRE_WRAP : Int = 4
+
+pub fn abi_probe(Int) -> Int
+
+pub fn build_tree(Int, CommandBuffer) -> Result[Unit, Int]
+
+pub fn button(CommandBuffer, ButtonProps) -> Unit
+
+pub fn checkbox(CommandBuffer, Bool, String, Int) -> Unit
+
+pub fn classify_status(Int) -> GpuiError
+
+pub fn copy_async_payload(Int, Int) -> Bytes
+
+pub fn debug_dump_text(Int) -> Result[String, Int]
+
+pub fn decode_event(Int, Int, Int, Int) -> Event
+
+pub fn dispatch_entry(Int, Int, Int, Int, Int) -> Int
+
+pub fn expect_ok(Result[Unit, Int], String) -> Unit
+
+pub fn framework_dispatch(RenderCtx, Int, Int, Int, Int, Int, (Int) -> Result[Unit, Int]) -> Int
+
+pub fn input_set_text(Int, Int, String) -> Result[Unit, Int]
+
+pub fn input_text(Int, Int) -> Result[String, Int]
+
+pub fn labeled_row(CommandBuffer, String, String, String) -> Unit
+
+pub fn post_event(Int, Bytes) -> Result[Unit, Int]
+
+pub fn register_dispatch((Int, Int, Int, Int, Int) -> Int) -> Unit
+
+pub fn run_window(Int, Float, Float) -> Result[Unit, Int]
+
+pub fn scroll_state(Int, Int) -> Result[ScrollState, Int]
+
+pub fn status_message(Int) -> String
+
+pub fn text_input(CommandBuffer, TextInputProps) -> Unit
+
+pub fn update_text(Int, String, String) -> Result[Unit, Int]
+
+// Errors
+
+// Types and methods
+pub(all) struct ButtonProps {
+  key : String
+  label : String
+  color : Color
+  on_click : HandlerId
+}
+
+pub(all) struct CellId[T] {
+  get : () -> T
+  set : (T) -> Unit
+}
+
+pub struct Color {
+  red : Int
+  green : Int
+  blue : Int
+  alpha : Int
+}
+pub fn Color::black() -> Self
+pub fn Color::rgb(Int, Int, Int) -> Self
+pub fn Color::rgba(Int, Int, Int, Int) -> Self
+pub fn Color::transparent() -> Self
+pub fn Color::white() -> Self
+
+pub struct CommandBuffer {
+  buf : @buffer.Buffer
+}
+pub fn CommandBuffer::add_child(Self) -> Unit
+pub fn CommandBuffer::div(Self) -> Unit
+pub fn CommandBuffer::new() -> Self
+pub fn CommandBuffer::rich_text(Self, Array[(String, RunStyle?)], Int, Int, Int, Float) -> Unit
+#deprecated
+pub fn CommandBuffer::set_absolute(Self, Int) -> Unit
+pub fn CommandBuffer::set_align(Self, Int, Int) -> Unit
+pub fn CommandBuffer::set_bg(Self, Int, Int, Int) -> Unit
+pub fn CommandBuffer::set_bg_color(Self, Color) -> Unit
+pub fn CommandBuffer::set_border(Self, Float, Int, Int, Int) -> Unit
+pub fn CommandBuffer::set_border_color(Self, Float, Color) -> Unit
+pub fn CommandBuffer::set_center(Self) -> Unit
+pub fn CommandBuffer::set_cursor(Self, Int) -> Unit
+pub fn CommandBuffer::set_flex(Self, Float, Float, Float) -> Unit
+pub fn CommandBuffer::set_flex_col(Self) -> Unit
+pub fn CommandBuffer::set_flex_row(Self) -> Unit
+pub fn CommandBuffer::set_focusable(Self, Int) -> Unit
+pub fn CommandBuffer::set_font_family(Self, String) -> Unit
+pub fn CommandBuffer::set_font_weight(Self, Int) -> Unit
+pub fn CommandBuffer::set_gap(Self, Float) -> Unit
+pub fn CommandBuffer::set_inset(Self, Int, Int, Int, Int) -> Unit
+pub fn CommandBuffer::set_key(Self, String) -> Unit
+pub fn CommandBuffer::set_line_height(Self, Float) -> Unit
+pub fn CommandBuffer::set_margin(Self, Int, Int, Int, Int) -> Unit
+pub fn CommandBuffer::set_max_size(Self, Int, Int) -> Unit
+pub fn CommandBuffer::set_min_size(Self, Int, Int) -> Unit
+pub fn CommandBuffer::set_on_click(Self, Int) -> Unit
+pub fn CommandBuffer::set_opacity(Self, Float) -> Unit
+pub fn CommandBuffer::set_overflow(Self, Int, Int) -> Unit
+pub fn CommandBuffer::set_padding(Self, Float) -> Unit
+pub fn CommandBuffer::set_padding_sides(Self, Int, Int, Int, Int) -> Unit
+pub fn CommandBuffer::set_position(Self, Int) -> Unit
+pub fn CommandBuffer::set_root(Self) -> Unit
+pub fn CommandBuffer::set_rounded(Self, Float) -> Unit
+pub fn CommandBuffer::set_scroll_id(Self, Int) -> Unit
+pub fn CommandBuffer::set_shadow(Self, Int, Int, Int, Int, Color) -> Unit
+pub fn CommandBuffer::set_size(Self, Float, Float) -> Unit
+pub fn CommandBuffer::set_tab_index(Self, Int) -> Unit
+pub fn CommandBuffer::set_tab_stop(Self, Int) -> Unit
+pub fn CommandBuffer::set_text_align(Self, Int) -> Unit
+pub fn CommandBuffer::set_text_color(Self, Color) -> Unit
+pub fn CommandBuffer::set_text_size(Self, Int) -> Unit
+pub fn CommandBuffer::set_whitespace(Self, Int) -> Unit
+pub fn CommandBuffer::text(Self, String, Int, Int, Int, Float) -> Unit
+pub fn CommandBuffer::text_input(Self, Int, String) -> Unit
+pub fn CommandBuffer::text_run(Self, Int, Int, RunStyle) -> Unit
+pub fn CommandBuffer::to_bytes(Self) -> Bytes
+
+pub(all) enum Event {
+  Click(Int)
+  Key(Int, Int)
+  Text(String)
+  NamedKey(Int, Int)
+  Async(Bytes)
+  InputChanged(Int)
+  InputSubmit(Int)
+  Scroll(Int)
+  Unknown
+}
+
+pub enum GpuiError {
+  InvalidHandle
+  WrongNodeKind
+  NodeAbsent
+  InternalPanic
+  BadBufferVersion
+  TruncatedBuffer
+  UnknownOpcode
+  NoRoot
+  DuplicateKey
+  KeyNotFound
+  QueueFull
+  PayloadTooLarge
+  BusyComposing
+  InvalidFloat
+  DepthExceeded
+  Unknown(Int)
+}
+pub fn GpuiError::code(Self) -> Int
+pub fn GpuiError::message(Self) -> String
+pub fn GpuiError::to_string(Self) -> String
+
+pub(all) struct HandlerId {
+  raw : Int
+}
+pub fn HandlerId::to_int(Self) -> Int
+
+pub(all) struct HandlerRegistry {
+  click : Map[Int, (Int) -> Unit]
+  input_changed : Map[Int, (Int) -> Unit]
+  input_submit : Map[Int, (Int) -> Unit]
+  scroll : Map[Int, (Int) -> Unit]
+  key : Array[(Int, (Int, Int) -> Unit)]
+  named_key : Array[(Int, (Int, Int) -> Unit)]
+  text : Array[(Int, (String) -> Unit)]
+  async_ : Array[(Int, (Bytes) -> Unit)]
+  mut next_id : Int
+}
+pub fn HandlerRegistry::dispatch(Self, Event, Int) -> Unit
+pub fn HandlerRegistry::new() -> Self
+pub fn HandlerRegistry::new_input_id(Self) -> InputId
+pub fn HandlerRegistry::new_scroll_id(Self) -> ScrollId
+pub fn HandlerRegistry::on_async(Self, (Bytes) -> Unit) -> Int
+pub fn HandlerRegistry::on_click(Self, (Int) -> Unit) -> HandlerId
+pub fn HandlerRegistry::on_input_changed(Self, InputId, (Int) -> Unit) -> Unit
+pub fn HandlerRegistry::on_key(Self, (Int, Int) -> Unit) -> Int
+pub fn HandlerRegistry::on_named_key(Self, (Int, Int) -> Unit) -> Int
+pub fn HandlerRegistry::on_scroll(Self, ScrollId, (Int) -> Unit) -> Unit
+pub fn HandlerRegistry::on_submit(Self, InputId, (Int) -> Unit) -> Unit
+pub fn HandlerRegistry::on_text(Self, (String) -> Unit) -> Int
+
+pub(all) struct InputId {
+  raw : Int
+}
+pub fn InputId::to_int(Self) -> Int
+
+pub(all) struct RenderCtx {
+  view : Int
+  store : Store
+  handlers : HandlerRegistry
+}
+
+pub(all) struct RunStyle {
+  color : Color?
+  weight : Int?
+  italic : Bool
+  underline : Bool
+  strikethrough : Bool
+  background : Color?
+}
+pub fn RunStyle::new(color? : Color, weight? : Int, italic? : Bool, underline? : Bool, strikethrough? : Bool, background? : Color) -> Self
+
+pub(all) struct ScrollId {
+  raw : Int
+}
+pub fn ScrollId::to_int(Self) -> Int
+
+pub(all) struct ScrollState {
+  offset_x : Float
+  offset_y : Float
+  max_x : Float
+  max_y : Float
+  viewport_w : Float
+  viewport_h : Float
+}
+
+pub(all) struct Signal[T] {
+  cell : CellId[T]
+}
+pub fn[T] Signal::get(Self[T], Store) -> T
+pub fn[T] Signal::set(Self[T], Store, T) -> Unit
+
+pub(all) struct Store {
+  int_cells : Map[String, @ref.Ref[Int]]
+  bool_cells : Map[String, @ref.Ref[Bool]]
+  string_cells : Map[String, @ref.Ref[String]]
+  float_cells : Map[String, @ref.Ref[Float]]
+  mut dirty : Bool
+}
+pub fn Store::begin_dirty_tracking(Self) -> Unit
+pub fn[T : KeyedCell] Store::cell_for_key(Self, String, T) -> CellId[T]
+pub fn[T] Store::get(Self, CellId[T]) -> T
+pub fn Store::has_dirty(Self) -> Bool
+pub fn Store::new() -> Self
+pub fn[T] Store::new_cell(Self, T) -> CellId[T]
+pub fn[T] Store::set(Self, CellId[T], T) -> Unit
+pub fn[T] Store::signal(Self, CellId[T]) -> Signal[T]
+
+pub(all) struct TextInputProps {
+  key : String
+  input_id : InputId
+  placeholder : String
+  min_width : Int
+}
+
+// Type aliases
+pub type AsyncHandler = (Bytes) -> Unit
+
+pub type ClickHandler = (Int) -> Unit
+
+pub type InputChangedHandler = (Int) -> Unit
+
+pub type InputSubmitHandler = (Int) -> Unit
+
+pub type KeyHandler = (Int, Int) -> Unit
+
+pub type NamedKeyHandler = (Int, Int) -> Unit
+
+pub type ScrollHandler = (Int) -> Unit
+
+pub type TextHandler = (String) -> Unit
+
+// Traits
+pub trait KeyedCell {
+  fn keyed_pool(Store) -> Map[String, @ref.Ref[Self]]
+}
+pub impl KeyedCell for Bool
+pub impl KeyedCell for Int
+pub impl KeyedCell for Float
+pub impl KeyedCell for String
