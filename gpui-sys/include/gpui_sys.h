@@ -226,6 +226,8 @@ int32_t gpui_update_text(int32_t view,
  */
 int32_t gpui_run_window(int32_t view, float width, float height);
 
+extern void md_editor_benchmark_signpost_event(int32_t action_id);
+
 int32_t gpui_run_window_benchmark(int32_t view,
                                   float width,
                                   float height,

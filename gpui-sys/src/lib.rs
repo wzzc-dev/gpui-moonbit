@@ -2015,10 +2015,14 @@ struct WindowBenchmark {
     previous_frame: Option<std::time::Instant>,
     action_started: Option<std::time::Instant>,
     pending_work_ms: f64,
+    paint_work_ms: Option<f64>,
     first_interactive_ms: f64,
     work_samples: Vec<f64>,
+    dispatch_work_samples: Vec<f64>,
     samples: Vec<f64>,
     latencies: Vec<f64>,
+    action_timestamps_epoch_ms: Vec<f64>,
+    action_window_end_epoch_ms: Option<f64>,
     completed: usize,
     warming_up: bool,
     action_index: usize,
@@ -2026,8 +2030,20 @@ struct WindowBenchmark {
 
 static WINDOW_BENCHMARK: Mutex<Option<WindowBenchmark>> = Mutex::new(None);
 
+unsafe extern "C" {
+    fn md_editor_benchmark_signpost_event(action_id: i32);
+}
+
 fn benchmark_milliseconds(started: std::time::Instant, finished: std::time::Instant) -> f64 {
     finished.duration_since(started).as_secs_f64() * 1000.0
+}
+
+fn benchmark_epoch_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0
 }
 
 #[unsafe(no_mangle)]
@@ -2053,10 +2069,14 @@ pub extern "C" fn gpui_run_window_benchmark(
             previous_frame: None,
             action_started: None,
             pending_work_ms: 0.0,
+            paint_work_ms: None,
             first_interactive_ms: 0.0,
             work_samples: Vec::new(),
+            dispatch_work_samples: Vec::new(),
             samples: Vec::new(),
             latencies: Vec::new(),
+            action_timestamps_epoch_ms: Vec::new(),
+            action_window_end_epoch_ms: None,
             completed: 0,
             warming_up: scenario != 0,
             action_index: 0,
@@ -2128,7 +2148,7 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
         if st.previous_frame.is_none() {
             st.first_interactive_ms = benchmark_milliseconds(st.started, now);
             if st.scenario == 0 {
-                st.work_samples.push(0.0);
+                st.work_samples.push(st.paint_work_ms.take().unwrap_or(0.0));
                 report = Some(benchmark_report_json_v2(&st));
             }
         } else if st.warming_up {
@@ -2136,17 +2156,23 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
         } else {
             let previous = st.previous_frame.expect("previous frame");
             st.samples.push(benchmark_milliseconds(previous, now));
-            st.work_samples.push(st.pending_work_ms);
+            st.work_samples.push(st.paint_work_ms.take().unwrap_or(st.pending_work_ms));
+            st.dispatch_work_samples.push(st.pending_work_ms);
             let action = st.action_started.expect("action start");
             st.latencies.push(benchmark_milliseconds(action, now));
             st.completed += 1;
             if st.completed >= st.target {
+                st.action_window_end_epoch_ms = Some(benchmark_epoch_ms());
                 report = Some(benchmark_report_json_v2(&st));
             }
         }
         if report.is_none() {
             st.previous_frame = Some(now);
             st.action_started = Some(std::time::Instant::now());
+            if !st.warming_up {
+                unsafe { md_editor_benchmark_signpost_event(st.action_index as i32) };
+                st.action_timestamps_epoch_ms.push(benchmark_epoch_ms());
+            }
             let (scenario, index, stride) = (st.scenario, st.action_index, st.stride);
             st.action_index += 1;
             drop(guard);
@@ -2198,6 +2224,14 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
         let _ = writeln!(out, "{report_text}");
         let _ = out.flush();
     }
+    if std::env::var("UI_BENCHMARK_SYSTEM_PRESENT").ok().as_deref() == Some("1") {
+        let tail_ms = std::env::var("UI_BENCHMARK_TRACE_TAIL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(15_000)
+            .min(120_000);
+        std::thread::sleep(std::time::Duration::from_millis(tail_ms));
+    }
     cx.quit();
 }
 
@@ -2215,9 +2249,17 @@ fn benchmark_report_json_v2(st: &WindowBenchmark) -> String {
     let encode = |values: &[f64]| values.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(",");
     let input_samples = if st.scenario == 1 { encode(&st.latencies) } else { String::new() };
     let input_mean = if st.scenario == 1 { average(&st.latencies) } else { 0.0 };
+    let action_timestamps = encode(&st.action_timestamps_epoch_ms);
+    let action_window_start = st.action_timestamps_epoch_ms.first()
+        .map(f64::to_string)
+        .unwrap_or_else(|| "null".to_string());
+    let action_window_end = st.action_window_end_epoch_ms
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"adapter\":\"gpui\",\"measurement_scope\":\"ui-frame\",\"timing_source\":\"gpui-on_next_frame-and-action-dispatch\",\"latency_source\":\"action-to-on_next_frame\",\"scenario\":\"{scenario}\",\"frame_work_samples_ms\":[{work}],\"frame_interval_samples_ms\":[{intervals}],\"input_to_visible_samples_ms\":[{input_samples}],\"offscreen_samples_ms\":[{nulls}],\"readback_samples_ms\":[{nulls}],\"offscreen_readback_samples_ms\":[{nulls}],\"frame_work_ms\":{work_mean},\"frame_interval_ms\":{interval_mean},\"input_to_visible_ms\":{input_mean},\"offscreen_ms\":null,\"readback_ms\":null,\"offscreen_readback_ms\":null,\"frame_work_p95_ms\":{work_p95},\"frame_interval_p95_ms\":{interval_p95},\"input_to_visible_p95_ms\":{input_p95},\"dropped_display_frames\":{dropped},\"action_count\":{actions},\"frame_sample_count\":{frames},\"warmup_action_count\":{warmups},\"first_interactive_ms\":{first_interactive},\"document_load_ms\":{document_load},\"window_mode\":\"native-window\",\"work_scope\":\"action-dispatch-only\",\"display_timestamp_source\":\"gpui-on_next_frame-callback-not-os-present\",\"viewport\":{{\"width\":1280,\"height\":800}},\"font\":\"system-ui 16px\",\"line_height\":1.55,\"overscan\":3,\"virtual_row_height\":66}}",
+                "{{\"adapter\":\"gpui\",\"measurement_scope\":\"ui-frame\",\"timing_source\":\"gpui-request-layout-prepaint-paint-and-on_next_frame\",\"latency_source\":\"action-signpost-to-compositor-present\",\"scenario\":\"{scenario}\",\"frame_work_samples_ms\":[{work}],\"dispatch_work_samples_ms\":[{dispatch_work}],\"frame_interval_samples_ms\":[{intervals}],\"input_to_visible_samples_ms\":[{input_samples}],\"offscreen_samples_ms\":[{nulls}],\"readback_samples_ms\":[{nulls}],\"offscreen_readback_samples_ms\":[{nulls}],\"frame_work_ms\":{work_mean},\"frame_interval_ms\":{interval_mean},\"input_to_visible_ms\":{input_mean},\"offscreen_ms\":null,\"readback_ms\":null,\"offscreen_readback_ms\":null,\"frame_work_p95_ms\":{work_p95},\"frame_interval_p95_ms\":{interval_p95},\"input_to_visible_p95_ms\":{input_p95},\"dropped_display_frames\":{dropped},\"action_count\":{actions},\"frame_sample_count\":{frames},\"warmup_action_count\":{warmups},\"action_timestamps_epoch_ms\":[{action_timestamps}],\"action_window_start_epoch_ms\":{action_window_start},\"action_window_end_epoch_ms\":{action_window_end},\"first_interactive_ms\":{first_interactive},\"document_load_ms\":{document_load},\"window_mode\":\"native-window\",\"work_scope\":\"gpui-request-layout-prepaint-paint\",\"display_timestamp_source\":\"macos-compositor-trace\",\"viewport\":{{\"width\":1280,\"height\":800}},\"font\":\"system-ui 16px\",\"line_height\":1.55,\"overscan\":3,\"virtual_row_height\":66}}",
         work = encode(&st.work_samples),
+        dispatch_work = encode(&st.dispatch_work_samples),
         intervals = encode(&st.samples),
         input_samples = input_samples,
         nulls = (0..st.work_samples.len()).map(|_| "null").collect::<Vec<_>>().join(","),
@@ -2231,6 +2273,9 @@ fn benchmark_report_json_v2(st: &WindowBenchmark) -> String {
         actions = st.target,
         frames = st.samples.len(),
         warmups = if st.scenario == 0 { 0 } else { 1 },
+        action_timestamps = action_timestamps,
+        action_window_start = action_window_start,
+        action_window_end = action_window_end,
         first_interactive = st.first_interactive_ms,
         document_load = st.document_load_ms,
     )
@@ -3200,7 +3245,89 @@ impl Render for FfiView {
                 d = d.child(el);
             }
         }
-        d
+        let element = d.into_any_element();
+        if benchmark_window_active() {
+            BenchmarkFrameProbe { child: element }.into_any_element()
+        } else {
+            element
+        }
+    }
+}
+
+fn benchmark_window_active() -> bool {
+    WINDOW_BENCHMARK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+}
+
+struct BenchmarkFrameProbe {
+    child: AnyElement,
+}
+
+impl Element for BenchmarkFrameProbe {
+    type RequestLayoutState = std::time::Instant;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let started = std::time::Instant::now();
+        let layout = self.child.request_layout(window, cx);
+        (layout, started)
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.paint(window, cx);
+        let elapsed = benchmark_milliseconds(*state, std::time::Instant::now());
+        if let Some(benchmark) = WINDOW_BENCHMARK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            benchmark.paint_work_ms = Some(elapsed);
+        }
+    }
+}
+
+impl IntoElement for BenchmarkFrameProbe {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
     }
 }
 

@@ -47,6 +47,7 @@ stacker = "0.1"
 
 [build-dependencies]
 cbindgen = "0.28"
+cc = "1"
 
 [dev-dependencies]
 # Test-only: gpui's headless TestAppContext harness backs the G24 golden

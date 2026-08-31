@@ -2375,6 +2375,7 @@ name = "gpui-sys"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "cc",
  "criterion",
  "futures",
  "gpui",

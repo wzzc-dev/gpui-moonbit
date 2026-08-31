@@ -88,6 +88,9 @@ fn mangled_callback_symbol(module: &str, name: &str) -> String {
 }
 
 fn main() {
+    cc::Build::new()
+        .file("src/benchmark_signpost.c")
+        .compile("md_editor_benchmark_signpost");
     // --- Shared Rust/MoonBit ABI ---
     println!("cargo:rerun-if-changed=abi.toml");
     let abi = std::fs::read_to_string("abi.toml").expect("read abi.toml");
