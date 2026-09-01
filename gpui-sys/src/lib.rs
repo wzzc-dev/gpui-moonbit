@@ -2105,14 +2105,36 @@ fn benchmark_drive_action(
     scenario: i32,
     index: usize,
     stride: f32,
+    view: i32,
 ) {
     match scenario {
         // Append one char through the same commit path real typing uses:
         // apply to the model, refresh the mirror, emit EVENT_INPUT_CHANGED so
         // MoonBit pulls the text, rebuilds and recommits the tree.
+        // Apps that never commit a text input (keyboard-driven editors that
+        // receive typed characters as EVENT_TEXT) have no retained model; for
+        // those, synthesize the same EVENT_TEXT payload the AppKit
+        // `on_key_down` handler pushes, so the injected action travels the
+        // identical dispatch/rebuild path as a real keystroke.
         1 => {
             let models: Vec<Entity<TextInputModel>> =
                 inputs.borrow().values().cloned().collect();
+            if models.is_empty() {
+                let bytes = char::from(b'a' + (index % 26) as u8)
+                    .to_string()
+                    .into_bytes();
+                let len = bytes.len() as i32;
+                let token = {
+                    let mut q = EVENT_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                    q.push(bytes);
+                    (q.len() - 1) as i32
+                };
+                unsafe { mb_dispatch(ABI_VERSION, EVENT_TEXT, view, token, len) };
+                // #70: the payload is only valid during the synchronous
+                // dispatch; drop it so the queue cannot grow with actions.
+                EVENT_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                return;
+            }
             for model in models {
                 model.update(cx, |m, cx| {
                     let ch = char::from(b'a' + (index % 26) as u8);
@@ -2222,6 +2244,7 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
                     scenario,
                     index,
                     stride,
+                    view.view as i32,
                 );
                 // Input changes need MoonBit to rebuild the formatted tree;
                 // native scroll offsets are already owned by GPUI and should
@@ -2290,6 +2313,13 @@ fn benchmark_report_json_v2(st: &WindowBenchmark) -> String {
         if measured(values).is_empty() { "null".to_string() } else { value.to_string() }
     };
     let strict_trace = std::env::var("UI_BENCHMARK_SYSTEM_PRESENT").ok().as_deref() == Some("1");
+    // The harness treats the adapter-emitted `adapter` field as authoritative,
+    // so a second app built on this benchmark loop (e.g. gpui2) overrides the
+    // default name instead of colliding with the original `gpui` rows.
+    let adapter_name = std::env::var("UI_BENCHMARK_ADAPTER_NAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "gpui".to_string());
     let input_samples = if st.scenario == 1 { encode(&st.latencies) } else { String::new() };
     let input_mean = if st.scenario == 1 { average(&st.latencies) } else { 0.0 };
     let action_timestamps = encode(&st.action_timestamps_epoch_ms);
@@ -2300,7 +2330,8 @@ fn benchmark_report_json_v2(st: &WindowBenchmark) -> String {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "null".to_string());
     format!(
-                "{{\"adapter\":\"gpui\",\"measurement_scope\":\"ui-frame\",\"timing_source\":\"gpui-request-layout-prepaint-paint-and-on_next_frame\",\"latency_source\":\"action-to-next-frame-callback\",\"scenario\":\"{scenario}\",\"frame_work_samples_ms\":[{work}],\"dispatch_work_samples_ms\":[{dispatch_work}],\"frame_interval_samples_ms\":[{intervals}],\"input_to_visible_samples_ms\":[{input_samples}],\"offscreen_samples_ms\":[{nulls}],\"readback_samples_ms\":[{nulls}],\"offscreen_readback_samples_ms\":[{nulls}],\"frame_work_ms\":{work_mean},\"frame_interval_ms\":{interval_mean},\"input_to_visible_ms\":{input_mean},\"offscreen_ms\":null,\"readback_ms\":null,\"offscreen_readback_ms\":null,\"frame_work_p95_ms\":{work_p95},\"frame_interval_p95_ms\":{interval_p95},\"input_to_visible_p95_ms\":{input_p95},\"dropped_display_frames\":null,\"action_count\":{actions},\"frame_sample_count\":{frames},\"warmup_action_count\":{warmups},\"action_timestamps_epoch_ms\":[{action_timestamps}],\"action_window_start_epoch_ms\":{action_window_start},\"action_window_end_epoch_ms\":{action_window_end},\"first_interactive_ms\":{first_interactive},\"document_load_ms\":{document_load},\"window_mode\":\"native-window\",\"work_scope\":\"gpui-request-layout-prepaint-paint\",\"display_timestamp_source\":\"{display_timestamp_source}\",\"viewport\":{{\"width\":1280,\"height\":800}},\"font\":\"system-ui 16px\",\"line_height\":1.55,\"overscan\":3,\"virtual_row_height\":66}}",
+        "{{\"adapter\":\"{adapter}\",\"measurement_scope\":\"ui-frame\",\"timing_source\":\"gpui-request-layout-prepaint-paint-and-on_next_frame\",\"latency_source\":\"action-to-next-frame-callback\",\"scenario\":\"{scenario}\",\"frame_work_samples_ms\":[{work}],\"dispatch_work_samples_ms\":[{dispatch_work}],\"frame_interval_samples_ms\":[{intervals}],\"input_to_visible_samples_ms\":[{input_samples}],\"offscreen_samples_ms\":[{nulls}],\"readback_samples_ms\":[{nulls}],\"offscreen_readback_samples_ms\":[{nulls}],\"frame_work_ms\":{work_mean},\"frame_interval_ms\":{interval_mean},\"input_to_visible_ms\":{input_mean},\"offscreen_ms\":null,\"readback_ms\":null,\"offscreen_readback_ms\":null,\"frame_work_p95_ms\":{work_p95},\"frame_interval_p95_ms\":{interval_p95},\"input_to_visible_p95_ms\":{input_p95},\"dropped_display_frames\":null,\"action_count\":{actions},\"frame_sample_count\":{frames},\"warmup_action_count\":{warmups},\"action_timestamps_epoch_ms\":[{action_timestamps}],\"action_window_start_epoch_ms\":{action_window_start},\"action_window_end_epoch_ms\":{action_window_end},\"first_interactive_ms\":{first_interactive},\"document_load_ms\":{document_load},\"window_mode\":\"native-window\",\"work_scope\":\"gpui-request-layout-prepaint-paint\",\"display_timestamp_source\":\"{display_timestamp_source}\",\"viewport\":{{\"width\":1280,\"height\":800}},\"font\":\"system-ui 16px\",\"line_height\":1.55,\"overscan\":3,\"virtual_row_height\":66}}",
+        adapter = adapter_name,
         work = encode(&st.work_samples),
         dispatch_work = encode(&st.dispatch_work_samples),
         intervals = encode(&st.samples),
