@@ -44,3 +44,35 @@ pub fn framework_dispatch(
     0
   }
 }
+
+/// Dispatch with an optional retained-tree patch before falling back to a full
+/// rebuild. The patch callback must return `false` when styling or structure
+/// changed and the complete command tree is required.
+pub fn framework_dispatch_with_patch(
+  ctx : RenderCtx,
+  version : Int,
+  kind : Int,
+  view : Int,
+  data_a : Int,
+  data_b : Int,
+  patch : (Int) -> Bool,
+  rebuild : (Int) -> Result[Unit, Int],
+) -> Int {
+  if version != ABI_VERSION {
+    return 0
+  }
+  ctx.store.begin_dirty_tracking()
+  ctx.handlers.dispatch(decode_event(version, kind, data_a, data_b), view)
+  if !ctx.store.has_dirty() {
+    return 0
+  }
+  if patch(view) {
+    // The retained tree now reflects the changed state; clear the marker so
+    // the next dispatch starts with a clean dirty-tracking window.
+    ctx.store.begin_dirty_tracking()
+    1
+  } else {
+    ignore(rebuild(view))
+    1
+  }
+}

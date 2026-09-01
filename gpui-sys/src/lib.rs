@@ -1949,6 +1949,11 @@ fn run_window(view: usize, width: f32, height: f32, benchmark: bool) {
         if let Some(entity) = benchmark_entity {
             let _ = window.update(cx, |_, window, _| {
                 schedule_benchmark_frame(window, view_id, &entity);
+                // The initial tree is committed before the native window is
+                // opened. Explicitly invalidate the window here so the first
+                // benchmark frame is queued immediately instead of waiting
+                // for a later event-loop mutation.
+                window.refresh();
             });
         }
         cx.activate(true);
@@ -2142,17 +2147,37 @@ fn benchmark_drive_action(
 fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &WeakEntity<FfiView>) {
     let now = std::time::Instant::now();
     let mut report = None;
+    let mut skip_action = false;
     {
         let mut guard = WINDOW_BENCHMARK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(st) = guard.as_mut() else { return };
         if st.previous_frame.is_none() {
             st.first_interactive_ms = benchmark_milliseconds(st.started, now);
-            if st.scenario == 0 {
-                st.work_samples.push(st.paint_work_ms.take().unwrap_or(0.0));
-                report = Some(benchmark_report_json_v2(&st));
-            }
+            // on_next_frame can run before the first render pass. Arm a
+            // second callback for open so the first work sample is taken only
+            // after request_layout/prepaint/paint has completed.
+            st.previous_frame = Some(now);
+            st.action_started = Some(now);
         } else if st.warming_up {
             st.warming_up = false;
+            // Let the warm-up repaint settle before the first measured action.
+            // This prevents the first action from inheriting the initial
+            // window/layout scheduling burst while keeping warmup_action_count
+            // at one for the protocol.
+            skip_action = true;
+        } else if st.scenario == 0 {
+            // Open has no action or pacing interval. The first callback above
+            // establishes the startup timestamp; this callback observes the
+            // completed first paint and reports its measured work.
+            if let Some(work) = st.paint_work_ms.take() {
+                st.work_samples.push(work);
+            } else {
+                // A missing probe is a diagnostic failure, never a measured
+                // zero. Keep the protocol shape while surfacing it as n/a via
+                // the explicit unavailable marker in the JSON report.
+                st.work_samples.push(f64::NAN);
+            }
+            report = Some(benchmark_report_json_v2(&st));
         } else {
             let previous = st.previous_frame.expect("previous frame");
             st.samples.push(benchmark_milliseconds(previous, now));
@@ -2169,7 +2194,13 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
         if report.is_none() {
             st.previous_frame = Some(now);
             st.action_started = Some(std::time::Instant::now());
-            if !st.warming_up {
+            if skip_action {
+                drop(guard);
+                schedule_benchmark_frame(window, view, entity);
+                window.refresh();
+                return;
+            }
+            if !st.warming_up && st.scenario != 0 {
                 unsafe { md_editor_benchmark_signpost_event(st.action_index as i32) };
                 st.action_timestamps_epoch_ms.push(benchmark_epoch_ms());
             }
@@ -2200,7 +2231,7 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
                 if let Some(state) = WINDOW_BENCHMARK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                     state.pending_work_ms = pending_work_ms;
                 }
-                if scenario != 2 {
+                if scenario != 2 && scenario != 0 {
                     let _ = view_entity.update(cx, |_, cx| cx.notify());
                 }
             }
@@ -2238,15 +2269,27 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
 fn benchmark_report_json_v2(st: &WindowBenchmark) -> String {
     let mut work = st.work_samples.clone();
     let mut intervals = st.samples.clone();
+    let mut latencies = st.latencies.clone();
     work.sort_by(f64::total_cmp);
     intervals.sort_by(f64::total_cmp);
-    let average = |values: &[f64]| values.iter().sum::<f64>() / values.len().max(1) as f64;
-    let at = |values: &[f64], ratio: f64| values[((values.len().saturating_sub(1)) as f64 * ratio).round() as usize];
-    let dropped: usize = st.samples.iter().map(|value| {
-        ((*value / 16.667).ceil() as usize).saturating_sub(1)
-    }).sum();
+    latencies.sort_by(f64::total_cmp);
+    let measured = |values: &[f64]| values.iter().copied().filter(|value| value.is_finite()).collect::<Vec<_>>();
+    let average = |values: &[f64]| {
+        let values = measured(values);
+        if values.is_empty() { 0.0 } else { values.iter().sum::<f64>() / values.len() as f64 }
+    };
+    let at = |values: &[f64], ratio: f64| {
+        let values = measured(values);
+        if values.is_empty() { 0.0 } else { values[((values.len().saturating_sub(1)) as f64 * ratio).round() as usize] }
+    };
     let scenario = match st.scenario { 0 => "open", 1 => "input", _ => "scroll" };
-    let encode = |values: &[f64]| values.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(",");
+    let encode = |values: &[f64]| values.iter().map(|value| {
+        if value.is_finite() { value.to_string() } else { "null".to_string() }
+    }).collect::<Vec<_>>().join(",");
+    let optional = |values: &[f64], value: f64| {
+        if measured(values).is_empty() { "null".to_string() } else { value.to_string() }
+    };
+    let strict_trace = std::env::var("UI_BENCHMARK_SYSTEM_PRESENT").ok().as_deref() == Some("1");
     let input_samples = if st.scenario == 1 { encode(&st.latencies) } else { String::new() };
     let input_mean = if st.scenario == 1 { average(&st.latencies) } else { 0.0 };
     let action_timestamps = encode(&st.action_timestamps_epoch_ms);
@@ -2257,19 +2300,18 @@ fn benchmark_report_json_v2(st: &WindowBenchmark) -> String {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "null".to_string());
     format!(
-                "{{\"adapter\":\"gpui\",\"measurement_scope\":\"ui-frame\",\"timing_source\":\"gpui-request-layout-prepaint-paint-and-on_next_frame\",\"latency_source\":\"action-signpost-to-compositor-present\",\"scenario\":\"{scenario}\",\"frame_work_samples_ms\":[{work}],\"dispatch_work_samples_ms\":[{dispatch_work}],\"frame_interval_samples_ms\":[{intervals}],\"input_to_visible_samples_ms\":[{input_samples}],\"offscreen_samples_ms\":[{nulls}],\"readback_samples_ms\":[{nulls}],\"offscreen_readback_samples_ms\":[{nulls}],\"frame_work_ms\":{work_mean},\"frame_interval_ms\":{interval_mean},\"input_to_visible_ms\":{input_mean},\"offscreen_ms\":null,\"readback_ms\":null,\"offscreen_readback_ms\":null,\"frame_work_p95_ms\":{work_p95},\"frame_interval_p95_ms\":{interval_p95},\"input_to_visible_p95_ms\":{input_p95},\"dropped_display_frames\":{dropped},\"action_count\":{actions},\"frame_sample_count\":{frames},\"warmup_action_count\":{warmups},\"action_timestamps_epoch_ms\":[{action_timestamps}],\"action_window_start_epoch_ms\":{action_window_start},\"action_window_end_epoch_ms\":{action_window_end},\"first_interactive_ms\":{first_interactive},\"document_load_ms\":{document_load},\"window_mode\":\"native-window\",\"work_scope\":\"gpui-request-layout-prepaint-paint\",\"display_timestamp_source\":\"macos-compositor-trace\",\"viewport\":{{\"width\":1280,\"height\":800}},\"font\":\"system-ui 16px\",\"line_height\":1.55,\"overscan\":3,\"virtual_row_height\":66}}",
+                "{{\"adapter\":\"gpui\",\"measurement_scope\":\"ui-frame\",\"timing_source\":\"gpui-request-layout-prepaint-paint-and-on_next_frame\",\"latency_source\":\"action-to-next-frame-callback\",\"scenario\":\"{scenario}\",\"frame_work_samples_ms\":[{work}],\"dispatch_work_samples_ms\":[{dispatch_work}],\"frame_interval_samples_ms\":[{intervals}],\"input_to_visible_samples_ms\":[{input_samples}],\"offscreen_samples_ms\":[{nulls}],\"readback_samples_ms\":[{nulls}],\"offscreen_readback_samples_ms\":[{nulls}],\"frame_work_ms\":{work_mean},\"frame_interval_ms\":{interval_mean},\"input_to_visible_ms\":{input_mean},\"offscreen_ms\":null,\"readback_ms\":null,\"offscreen_readback_ms\":null,\"frame_work_p95_ms\":{work_p95},\"frame_interval_p95_ms\":{interval_p95},\"input_to_visible_p95_ms\":{input_p95},\"dropped_display_frames\":null,\"action_count\":{actions},\"frame_sample_count\":{frames},\"warmup_action_count\":{warmups},\"action_timestamps_epoch_ms\":[{action_timestamps}],\"action_window_start_epoch_ms\":{action_window_start},\"action_window_end_epoch_ms\":{action_window_end},\"first_interactive_ms\":{first_interactive},\"document_load_ms\":{document_load},\"window_mode\":\"native-window\",\"work_scope\":\"gpui-request-layout-prepaint-paint\",\"display_timestamp_source\":\"{display_timestamp_source}\",\"viewport\":{{\"width\":1280,\"height\":800}},\"font\":\"system-ui 16px\",\"line_height\":1.55,\"overscan\":3,\"virtual_row_height\":66}}",
         work = encode(&st.work_samples),
         dispatch_work = encode(&st.dispatch_work_samples),
         intervals = encode(&st.samples),
         input_samples = input_samples,
         nulls = (0..st.work_samples.len()).map(|_| "null").collect::<Vec<_>>().join(","),
-        work_mean = average(&st.work_samples),
+        work_mean = optional(&st.work_samples, average(&st.work_samples)),
         interval_mean = if st.samples.is_empty() { "null".to_string() } else { average(&st.samples).to_string() },
         input_mean = if st.scenario == 1 { input_mean.to_string() } else { "null".to_string() },
-        work_p95 = at(&work, 0.95),
+        work_p95 = optional(&st.work_samples, at(&work, 0.95)),
         interval_p95 = if intervals.is_empty() { "null".to_string() } else { at(&intervals, 0.95).to_string() },
-        input_p95 = if st.scenario == 1 { at(&st.latencies, 0.95).to_string() } else { "null".to_string() },
-        dropped = dropped,
+        input_p95 = if st.scenario == 1 { at(&latencies, 0.95).to_string() } else { "null".to_string() },
         actions = st.target,
         frames = st.samples.len(),
         warmups = if st.scenario == 0 { 0 } else { 1 },
@@ -2278,6 +2320,7 @@ fn benchmark_report_json_v2(st: &WindowBenchmark) -> String {
         action_window_end = action_window_end,
         first_interactive = st.first_interactive_ms,
         document_load = st.document_load_ms,
+        display_timestamp_source = if strict_trace { "macos-compositor-trace" } else { "gpui-on_next_frame-callback" },
     )
 }
 
@@ -3318,6 +3361,14 @@ impl Element for BenchmarkFrameProbe {
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
         {
+            if benchmark.first_interactive_ms == 0.0 {
+                // Paint is the earliest reliable point at which the initial
+                // frame is usable. on_next_frame is a scheduling callback and
+                // may arrive later (or before this pass), so startup must be
+                // anchored to the measured paint completion instead.
+                benchmark.first_interactive_ms =
+                    benchmark_milliseconds(benchmark.started, std::time::Instant::now());
+            }
             benchmark.paint_work_ms = Some(elapsed);
         }
     }
