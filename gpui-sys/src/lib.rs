@@ -3940,9 +3940,18 @@ fn named_key_id(key: &str) -> Option<i32> {
 /// Typed text for a key event: `key_char` if present (the character that would
 /// be inserted, including IME-composed and multi-char keys), else the single
 /// `key` character. Returns `None` for pure modifier/navigation keys.
+///
+/// Control characters in `key_char` are NOT typed text: Enter carries "\n"
+/// (Tab "\t" is consumed by focus traversal before this runs). Those keys are
+/// already delivered as EVENT_NAMED_KEY; emitting their control char as
+/// EVENT_TEXT too made the adapter's `doc_paste("\n")` a content no-op that
+/// still pushed an undo snapshot — a plain Enter then needed two undos to take
+/// effect. The single-char fallback below already excludes control chars; the
+/// `key_char` branch must match that contract. (IME commits containing "\n"
+/// arrive through `replace_text_in_range`, not here, and stay multi-line.)
 fn typed_text(ev: &KeyDownEvent) -> Option<String> {
     if let Some(s) = &ev.keystroke.key_char {
-        if !s.is_empty() {
+        if !s.is_empty() && !s.chars().next().unwrap().is_control() {
             return Some(s.clone());
         }
     }
@@ -6067,6 +6076,30 @@ mod tests {
         // Keys without a committed character never take the IME branch.
         assert!(!ime_owned_when_idle("backspace", None));
         assert!(!ime_owned_when_idle("up", None));
+    }
+
+    fn key_event(key: &str, key_char: Option<&str>) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers::default(),
+                key: key.to_string(),
+                key_char: key_char.map(str::to_string),
+            },
+            is_held: false,
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn typed_text_skips_control_key_chars() {
+        // Enter's "\n" is delivered as EVENT_NAMED_KEY only: a stray
+        // EVENT_TEXT("\n") would push a no-op undo snapshot, making a plain
+        // Enter need two undos to take effect.
+        assert_eq!(typed_text(&key_event("enter", Some("\n"))), None);
+        // Printable keys keep their typed text.
+        assert_eq!(typed_text(&key_event("a", Some("a"))), Some("a".into()));
+        assert_eq!(typed_text(&key_event("space", Some(" "))), Some(" ".into()));
+        // Navigation keys produce nothing.
+        assert_eq!(typed_text(&key_event("up", None)), None);
     }
 
     #[::core::prelude::v1::test]
