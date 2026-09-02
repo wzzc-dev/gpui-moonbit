@@ -274,6 +274,15 @@ int32_t gpui_input_set_text(int32_t view, int32_t input_id, const uint8_t *ptr, 
  */
 int32_t gpui_scroll_copy_state(int32_t view, int32_t scroll_id, uint8_t *buf, int32_t len);
 
+/**
+ * Pull ABI: read a probe rect by key. `buf`/`len` carry the ASCII key bytes
+ * (no NUL required); on a hit writes rounded integer `(x, y, w, h)` as four
+ * little-endian i32s into `out` (16 bytes, caller pre-zeroed) and returns 0,
+ * else -1. Integer pixels are enough for the app's hit-testing; the app keeps
+ * sub-pixel precision in its own model.
+ */
+int32_t gpui_probe_rect(const uint8_t *buf, int32_t len, uint8_t *out);
+
 extern const void *TISCopyCurrentKeyboardInputSource(void);
 
 extern const void *TISGetInputSourceProperty(const void *source, const void *property_key);

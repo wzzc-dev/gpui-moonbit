@@ -3271,34 +3271,35 @@ fn dispatch_event_text(view: i32, text: &str) -> i32 {
     changed
 }
 
-/// Caret/candidate anchor per view: the window-space rect (x, y, w, h) of the
-/// div the app marked with `OP_SET_KEY "caret"`, captured by
-/// [`CaretBoundsProbe`] during paint. The app draws its own caret (an
-/// absolute-positioned overlay div), so gpui-sys cannot know where it is; the
-/// app tells us via the key, and `ImeBridge::bounds_for_range` hands this rect
-/// to the platform IME as the candidate-window anchor. Stale-by-design: the
-/// entry updates whenever the caret paints and is only ever consulted while
-/// marked text exists, which implies the caret is on screen.
-static IME_CARET_BOUNDS: Mutex<Option<HashMap<i32, [f32; 4]>>> = Mutex::new(None);
+/// Probe geometry table: window-space rect (x, y, w, h) per `OP_SET_KEY` the
+/// app tags with `caret` or `probe:*`, captured by [`ProbeBoundsProbe`] during
+/// prepaint. The app draws its own content, so gpui-sys cannot know where
+/// things are; the app claims geometry via keys: "caret" feeds the IME
+/// candidate anchor (`ImeBridge::bounds_for_range`), "probe:*" feeds the app's
+/// own hit-testing (drag selection maps mouse coords to token rects via the
+/// `gpui_probe_rect` pull export). A key "probe:clear" — the root's first
+/// child — wipes the table at the start of every frame, so rects can never go
+/// stale across frames/scrolls.
+static PROBE_BOUNDS: Mutex<Option<HashMap<String, [f32; 4]>>> = Mutex::new(None);
 
 /// Transparent wrapper (same shape as `TextGlyphInset`): records the wrapped
 /// div's prepaint bounds — already resolved absolute window-space coords,
 /// including taffy's placement of `Position::Absolute` — then paints the child
 /// untouched. Layout is fully delegated to the child's own layout node, so the
 /// wrapper is invisible to flex/absolute placement and hit-testing.
-struct CaretBoundsProbe {
+struct ProbeBoundsProbe {
     child: AnyElement,
-    view: i32,
+    key: String,
 }
 
-impl IntoElement for CaretBoundsProbe {
+impl IntoElement for ProbeBoundsProbe {
     type Element = Self;
     fn into_element(self) -> Self::Element {
         self
     }
 }
 
-impl Element for CaretBoundsProbe {
+impl Element for ProbeBoundsProbe {
     type RequestLayoutState = ();
     type PrepaintState = ();
 
@@ -3330,15 +3331,24 @@ impl Element for CaretBoundsProbe {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        *IME_CARET_BOUNDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashMap::from([(
-            self.view,
-            [
-                f32::from(bounds.origin.x),
-                f32::from(bounds.origin.y),
-                f32::from(bounds.size.width),
-                f32::from(bounds.size.height),
-            ],
-        )]));
+        let rect = [
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+        ];
+        {
+            // Lock is released before descending: probe divs nest (a caret
+            // overlay lives inside a token div, both keyed), and std Mutex is
+            // not reentrant.
+            let mut guard = PROBE_BOUNDS.lock().unwrap_or_else(|e| e.into_inner());
+            let table = guard.get_or_insert_with(HashMap::new);
+            if self.key == "probe:clear" {
+                // First probe of the frame (root's first child): fresh table.
+                table.clear();
+            }
+            table.insert(self.key.clone(), rect);
+        }
         self.child.prepaint(window, cx);
     }
 
@@ -3356,9 +3366,46 @@ impl Element for CaretBoundsProbe {
     }
 }
 
+/// Pull ABI: read a probe rect by key. `buf`/`len` carry the ASCII key bytes
+/// (no NUL required); on a hit writes rounded integer `(x, y, w, h)` as four
+/// little-endian i32s into `out` (16 bytes, caller pre-zeroed) and returns 0,
+/// else -1. Integer pixels are enough for the app's hit-testing; the app keeps
+/// sub-pixel precision in its own model.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_probe_rect(buf: *const u8, len: i32, out: *mut u8) -> i32 {
+    ffi_export("gpui_probe_rect", || {
+        if buf.is_null() || out.is_null() || len <= 0 {
+            return -1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+        let Ok(key) = std::str::from_utf8(bytes) else {
+            return -1;
+        };
+        let guard = PROBE_BOUNDS.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref().and_then(|table| table.get(key)) {
+            Some(rect) => {
+                unsafe {
+                    for (i, v) in rect.iter().enumerate() {
+                        let bytes = (v.round() as i32).to_le_bytes();
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(i * 4), 4);
+                    }
+                }
+                0
+            }
+            None => -1,
+        }
+    })
+}
+
 /// EVENT_ASYNC payload tag for IME preedit updates (app-private contract):
 /// one `0xEE` byte followed by the UTF-8 composing text; an empty text clears.
 const IME_PREEDIT_TAG: u8 = 0xEE;
+
+/// EVENT_ASYNC payload tag for mouse input (app-private contract): `0xEF`,
+/// a phase byte (0 = left-button down, 1 = dragged move, 2 = left-button up),
+/// then x and y as little-endian i32 window coords. The app hit-tests its own
+/// layout with these (drag selection).
+const MOUSE_TAG: u8 = 0xEF;
 
 fn ime_preedit_payload(text: &str) -> Vec<u8> {
     let mut payload = Vec::with_capacity(text.len() + 1);
@@ -3464,14 +3511,14 @@ impl InputHandler for ImeBridge {
         _cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
         // Anchor the candidate window at the app's painted caret: the rect of
-        // the div keyed "caret", captured by `CaretBoundsProbe` on the last
+        // the div keyed "caret", captured by `ProbeBoundsProbe` on the last
         // paint. Without one (caret never painted) fall back to the viewport
         // lower-left — no better anchor exists at bridge level.
-        if let Some([x, y, w, h]) = IME_CARET_BOUNDS
+        if let Some([x, y, w, h]) = PROBE_BOUNDS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .and_then(|m| m.get(&self.view))
+            .and_then(|m| m.get("caret"))
             .copied()
         {
             return Some(Bounds::new(point(px(x), px(y)), size(px(w), px(h))));
@@ -3554,6 +3601,24 @@ pub struct FfiView {
     /// lifetime story as `scroll_handles`: the tree rebuilds, the models
     /// survive, and everything here is main-thread only.
     inputs: Rc<RefCell<HashMap<i32, Entity<TextInputModel>>>>,
+}
+
+impl FfiView {
+    /// Forward one mouse event to MoonBit as an EVENT_ASYNC payload (see
+    /// `MOUSE_TAG`): phase (0 down / 1 dragged move / 2 up) + rounded x/y
+    /// window coords, little-endian i32. The adapter hit-tests its own layout
+    /// to turn these into drag selection.
+    fn dispatch_mouse(&self, phase: u8, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let x = f32::from(position.x).round() as i32;
+        let y = f32::from(position.y).round() as i32;
+        let mut payload = Vec::with_capacity(10);
+        payload.push(MOUSE_TAG);
+        payload.push(phase);
+        payload.extend_from_slice(&x.to_le_bytes());
+        payload.extend_from_slice(&y.to_le_bytes());
+        let changed = dispatch_injected(self.view as i32, payload);
+        notify_if_changed(changed, || cx.notify());
+    }
 }
 
 /// Paint-phase registration of the app-level IME bridge. `Window::handle_input`
@@ -3681,7 +3746,7 @@ impl Render for FfiView {
                 // counter in sync (adapter on_text), so a shortcut's swallowed
                 // stray EVENT_TEXT cannot also swallow a later IME commit.
                 let mods = &ev.keystroke.modifiers;
-                if ev.keystroke.key_char.is_some()
+                if ime_owned_when_idle(&ev.keystroke.key, ev.keystroke.key_char.as_deref())
                     && !mods.control
                     && !mods.platform
                     && !mods.function
@@ -3709,6 +3774,22 @@ impl Render for FfiView {
                     notify_if_changed(dispatch_event_text(view, &text).max(take_input_dirty()), || {
                         cx.notify();
                     });
+                }
+            }))
+            // Mouse input for the app's own drag selection: left-button
+            // down/up and dragged moves are forwarded as EVENT_ASYNC payloads
+            // (see `MOUSE_TAG`). Move events are only sent while the left
+            // button is held, so idle hovering never wakes MoonBit. Clicks
+            // keep flowing through the per-div on_click path untouched.
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _win, cx| {
+                this.dispatch_mouse(0, ev.position, cx);
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _win, cx| {
+                this.dispatch_mouse(2, ev.position, cx);
+            }))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _win, cx| {
+                if ev.dragging() {
+                    this.dispatch_mouse(1, ev.position, cx);
                 }
             }));
         if let Some(node) = &root {
@@ -3871,6 +3952,21 @@ fn typed_text(ev: &KeyDownEvent) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Whether a keydown must be handed to the IME even while no composition is
+/// in flight (the IME-passthrough branch). Printable keys are IME-owned: with
+/// a composing input source selected they must reach NSInputContext so the
+/// commit comes back as EVENT_TEXT. Enter is NOT IME-owned when idle: a
+/// non-composing IME answers a Return keydown with
+/// `doCommandBySelector:insertNewline:`, which gpui drops
+/// (`keystroke_for_do_command` is only set on the composing path), so
+/// intercepting it lost the key entirely — no newline, no text. Routing it to
+/// the normal `named_key_id` path restores EVENT_NAMED_KEY(KEY_ENTER). Safe
+/// even while composing: the mac window routes composing keydowns to the
+/// input context before this listener ever runs.
+fn ime_owned_when_idle(key: &str, key_char: Option<&str>) -> bool {
+    key != "enter" && key_char.is_some_and(|s| !s.is_empty())
 }
 
 /// Pack modifier flags into the `b` payload slot (bit0 ctrl, 1 alt, 2 shift,
@@ -4417,14 +4513,15 @@ fn render_node_inner(
                     (None, false) => Some(d.into_any_element()),
                 },
             };
-            // Caret anchor (app contract): a div keyed "caret" is the app's
-            // drawn caret; wrap it so its window-space rect feeds the IME
-            // candidate anchor (see `IME_CARET_BOUNDS`).
-            let el = if key.as_deref() == Some("caret") {
+            // Probe keys: "caret" is the app's drawn caret (candidate anchor);
+            // "probe:*" divs publish their window-space rects to the app's
+            // hit-testing (gpui_probe_rect pull ABI). Wrap the element so its
+            // prepaint bounds are recorded by `ProbeBoundsProbe`.
+            let el = if let Some(k) = key.as_deref().filter(|k| *k == "caret" || k.starts_with("probe:")) {
                 el.map(|child| {
-                    CaretBoundsProbe {
+                    ProbeBoundsProbe {
                         child,
-                        view: view_id,
+                        key: k.to_string(),
                     }
                     .into_any_element()
                 })
@@ -5957,6 +6054,19 @@ mod tests {
         assert_eq!(named_key_id("space"), None);
         assert_eq!(named_key_id(""), None);
         assert_eq!(named_key_id("f13"), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn ime_owned_when_idle_covers_printable_keys_but_not_enter() {
+        // Printable keys are IME-owned while an input source is selected.
+        assert!(ime_owned_when_idle("a", Some("a")));
+        assert!(ime_owned_when_idle("space", Some(" ")));
+        // Enter must fall through to the named-key path: an idle IME answers
+        // Return with insertNewline:, which gpui drops, losing the key.
+        assert!(!ime_owned_when_idle("enter", Some("\n")));
+        // Keys without a committed character never take the IME branch.
+        assert!(!ime_owned_when_idle("backspace", None));
+        assert!(!ime_owned_when_idle("up", None));
     }
 
     #[::core::prelude::v1::test]
