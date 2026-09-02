@@ -4,6 +4,7 @@ use gpui::*;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
@@ -3209,6 +3210,333 @@ pub extern "C" fn gpui_scroll_copy_state(view: i32, scroll_id: i32, buf: *mut u8
     })
 }
 
+// --- App-level IME bridge + clipboard ---------------------------------------
+//
+// Additive C surface (backward-compatible per issue #42: no existing opcode or
+// envelope shape changes). Two gaps hit apps that draw and edit text entirely
+// themselves (rich_text + app-level key handling) and therefore never commit an
+// OP_TEXT_INPUT widget:
+//
+// 1. IME. The mac window forwards every keyDown to NSInputContext after the
+//    app declines, but the NSTextInputClient queries behind it all land on
+//    `window.input_handler` — which is None for such apps. Composition cannot
+//    report marked text, commits are dropped, and the raw pinyin/kana letters
+//    were already dispatched as EVENT_TEXT, so CJK input degrades to latin
+//    letter insertion. `ImeBridge` is a window-level `InputHandler` registered
+//    on every FfiView paint: it tracks the marked range (so the mac window's
+//    `is_composing` routes in-composition keystrokes to the IME) and forwards
+//    committed text to MoonBit as EVENT_TEXT — the same payload a typed
+//    keystroke carries, so app-side text handling is unchanged. A real
+//    OP_TEXT_INPUT widget re-registers during its own paint and overrides the
+//    bridge for that window (last registration wins), preserving RFC 0003.
+//
+// (Clipboard is handled moon-side: adapter/native-stub talks to NSPasteboard
+// directly and synchronously — the same shape as moonbitlang/x/fs's stubs —
+// so no App-context bridge is needed here.)
+
+static IME_MARKED: Mutex<Option<HashMap<i32, Option<std::ops::Range<usize>>>>> = Mutex::new(None);
+
+fn ime_marked_get(view: i32) -> Option<std::ops::Range<usize>> {
+    IME_MARKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&view))
+        .cloned()
+        .flatten()
+}
+
+fn ime_marked_set(view: i32, marked: Option<Range<usize>>) {
+    IME_MARKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(view, marked);
+}
+
+/// Push `text` as an EVENT_TEXT payload and dispatch it synchronously (the
+/// shared commit path of typed keystrokes, IME commits, and clipboard reads).
+/// Returns the dispatch's `changed` flag.
+fn dispatch_event_text(view: i32, text: &str) -> i32 {
+    let bytes = text.as_bytes();
+    let token = {
+        let mut q = EVENT_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        q.push(bytes.to_vec());
+        (q.len() - 1) as i32
+    };
+    let changed = unsafe { mb_dispatch(ABI_VERSION, EVENT_TEXT, view, token, bytes.len() as i32) };
+    // #70: the payload is only valid during the synchronous dispatch call; drop
+    // it on return so the queue cannot accumulate one entry per event.
+    EVENT_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    changed
+}
+
+/// Caret/candidate anchor per view: the window-space rect (x, y, w, h) of the
+/// div the app marked with `OP_SET_KEY "caret"`, captured by
+/// [`CaretBoundsProbe`] during paint. The app draws its own caret (an
+/// absolute-positioned overlay div), so gpui-sys cannot know where it is; the
+/// app tells us via the key, and `ImeBridge::bounds_for_range` hands this rect
+/// to the platform IME as the candidate-window anchor. Stale-by-design: the
+/// entry updates whenever the caret paints and is only ever consulted while
+/// marked text exists, which implies the caret is on screen.
+static IME_CARET_BOUNDS: Mutex<Option<HashMap<i32, [f32; 4]>>> = Mutex::new(None);
+
+/// Transparent wrapper (same shape as `TextGlyphInset`): records the wrapped
+/// div's prepaint bounds — already resolved absolute window-space coords,
+/// including taffy's placement of `Position::Absolute` — then paints the child
+/// untouched. Layout is fully delegated to the child's own layout node, so the
+/// wrapper is invisible to flex/absolute placement and hit-testing.
+struct CaretBoundsProbe {
+    child: AnyElement,
+    view: i32,
+}
+
+impl IntoElement for CaretBoundsProbe {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for CaretBoundsProbe {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        // Transparent: the child's own layout node is ours.
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        *IME_CARET_BOUNDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashMap::from([(
+            self.view,
+            [
+                f32::from(bounds.origin.x),
+                f32::from(bounds.origin.y),
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+            ],
+        )]));
+        self.child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.paint(window, cx);
+    }
+}
+
+/// EVENT_ASYNC payload tag for IME preedit updates (app-private contract):
+/// one `0xEE` byte followed by the UTF-8 composing text; an empty text clears.
+const IME_PREEDIT_TAG: u8 = 0xEE;
+
+fn ime_preedit_payload(text: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(text.len() + 1);
+    payload.push(IME_PREEDIT_TAG);
+    payload.extend_from_slice(text.as_bytes());
+    payload
+}
+
+/// Window-level IME target for apps without a text-input widget. Stateless
+/// beyond the per-view marked range (kept in IME_MARKED so re-registering on
+/// every paint cannot reset an in-flight composition).
+struct ImeBridge {
+    view: i32,
+}
+
+impl InputHandler for ImeBridge {
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        // The bridge owns no text; an empty selection at 0 tells the IME that
+        // replacements start there. While marked text exists the IME manages
+        // its own replacement range and does not consult this.
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<std::ops::Range<usize>> {
+        ime_marked_get(self.view)
+    }
+
+    fn text_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<String> {
+        None
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _replacement_range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        ime_marked_set(self.view, None);
+        if text.is_empty() {
+            return;
+        }
+        // Clear the app-side preedit strip first (a commit replaces the marked
+        // span), then deliver the committed text. The rebuild those dispatches
+        // perform swaps the committed tree but schedules no frame — request
+        // one, or the commit only becomes visible on the next unrelated frame.
+        dispatch_injected(self.view, ime_preedit_payload(""));
+        dispatch_event_text(self.view, text);
+        window.refresh();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        // Composition update. The span is tracked so `is_composing` (mac
+        // window) keeps routing keystrokes to the IME until commit/unmark, and
+        // the composing text is forwarded as an EVENT_ASYNC preedit payload so
+        // the app can show what the IME owns (the candidate window alone is
+        // not enough feedback for mixed-input IMEs).
+        let marked = if new_text.is_empty() {
+            None
+        } else {
+            Some(0..new_text.encode_utf16().count())
+        };
+        ime_marked_set(self.view, marked);
+        dispatch_injected(self.view, ime_preedit_payload(new_text));
+        window.refresh();
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, _cx: &mut App) {
+        ime_marked_set(self.view, None);
+        dispatch_injected(self.view, ime_preedit_payload(""));
+        window.refresh();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        // Anchor the candidate window at the app's painted caret: the rect of
+        // the div keyed "caret", captured by `CaretBoundsProbe` on the last
+        // paint. Without one (caret never painted) fall back to the viewport
+        // lower-left — no better anchor exists at bridge level.
+        if let Some([x, y, w, h]) = IME_CARET_BOUNDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&self.view))
+            .copied()
+        {
+            return Some(Bounds::new(point(px(x), px(y)), size(px(w), px(h))));
+        }
+        let vp = window.viewport_size();
+        Some(Bounds::new(
+            point(px(0.), vp.height - px(40.)),
+            size(px(1.), px(1.)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn TISCopyCurrentKeyboardInputSource() -> *const std::ffi::c_void;
+    fn TISGetInputSourceProperty(
+        source: *const std::ffi::c_void,
+        property_key: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    static kTISPropertyInputSourceType: *const std::ffi::c_void;
+    static kTISTypeKeyboardInputMode: *const std::ffi::c_void;
+    static kTISTypeKeyboardInputMethodWithoutModes: *const std::ffi::c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFEqual(cf1: *const std::ffi::c_void, cf2: *const std::ffi::c_void) -> u8;
+    fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+/// Whether the current keyboard input source composes text — an input method
+/// (Pinyin, Kotoeri, Sogou, WeType, ...) or an input mode — rather than a
+/// plain layout (ABC, U.S., ...). Per-keystroke query;
+/// TISCopyCurrentKeyboardInputSource is a refcount copy.
+///
+/// The test compares `kTISPropertyInputSourceType` against the type constants
+/// by identity (`CFEqual`). A vendor prefix on `kTISPropertyInputSourceID`
+/// ("com.apple.inputmethod.") misses third-party IMEs whose bundle ids are
+/// not com.apple.* (Sogou, WeType, ...); their printable keystrokes then
+/// reach BOTH the app (typed_text → EVENT_TEXT) and the IME (commit →
+/// EVENT_TEXT), double-inserting every letter and digit.
+fn ime_input_source_active() -> bool {
+    unsafe {
+        let source = TISCopyCurrentKeyboardInputSource();
+        if source.is_null() {
+            return false;
+        }
+        let ty = TISGetInputSourceProperty(source, kTISPropertyInputSourceType);
+        let active = !ty.is_null()
+            && (CFEqual(ty, kTISTypeKeyboardInputMethodWithoutModes) != 0
+                || CFEqual(ty, kTISTypeKeyboardInputMode) != 0);
+        CFRelease(source);
+        active
+    }
+}
+
 pub struct FfiView {
     focus: FocusHandle,
     /// Index into `VIEWS` whose committed tree this view renders.
@@ -3226,6 +3554,75 @@ pub struct FfiView {
     /// lifetime story as `scroll_handles`: the tree rebuilds, the models
     /// survive, and everything here is main-thread only.
     inputs: Rc<RefCell<HashMap<i32, Entity<TextInputModel>>>>,
+}
+
+/// Paint-phase registration of the app-level IME bridge. `Window::handle_input`
+/// is a paint-time hook (it panics outside paint), so the bridge cannot be
+/// registered from `render`; this transparent wrapper owns the registration
+/// instead. A real OP_TEXT_INPUT widget paints later in the frame and
+/// re-registers its own handler over the bridge (last registration wins), so
+/// RFC 0003 behavior is untouched.
+struct ImeBridgeProbe {
+    child: AnyElement,
+    view: i32,
+    focus: FocusHandle,
+}
+
+impl IntoElement for ImeBridgeProbe {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ImeBridgeProbe {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        // Transparent: the child's own layout node is ours.
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.handle_input(&self.focus, ImeBridge { view: self.view }, cx);
+        self.child.paint(window, cx);
+    }
 }
 
 impl Render for FfiView {
@@ -3273,6 +3670,26 @@ impl Render for FfiView {
                 if input_focused {
                     return;
                 }
+                // IME passthrough: when an input method is active, printable
+                // keystrokes belong to the IME, not the app. Declining to
+                // dispatch them (and NOT stopping propagation) lets the mac
+                // window forward the native event to NSInputContext, whose
+                // client is the ImeBridge registered in `render`; committed
+                // text comes back as EVENT_TEXT. Cmd/Ctrl/Fn combos keep the
+                // normal path — they are shortcuts, not composition input.
+                // The unnamed-key marker keeps MoonBit's swallow-generation
+                // counter in sync (adapter on_text), so a shortcut's swallowed
+                // stray EVENT_TEXT cannot also swallow a later IME commit.
+                let mods = &ev.keystroke.modifiers;
+                if ev.keystroke.key_char.is_some()
+                    && !mods.control
+                    && !mods.platform
+                    && !mods.function
+                    && ime_input_source_active()
+                {
+                    unsafe { mb_dispatch(ABI_VERSION, EVENT_NAMED_KEY, view, 0, 0) };
+                    return;
+                }
                 let code = key_code(ev);
                 let mods = mods_bits(&ev.keystroke.modifiers);
                 if code != 0 {
@@ -3289,20 +3706,9 @@ impl Render for FfiView {
                 // payload lives in EVENT_QUEUE; MoonBit copies it via
                 // gpui_event_copy_text during the synchronous dispatch.
                 if let Some(text) = typed_text(ev) {
-                    let bytes = text.as_bytes();
-                    let token = {
-                        let mut q = EVENT_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                        q.push(bytes.to_vec());
-                        (q.len() - 1) as i32
-                    };
-                    let changed = unsafe {
-                        mb_dispatch(ABI_VERSION, EVENT_TEXT, view, token, bytes.len() as i32)
-                    };
-                    // #70: the payload is only valid during the synchronous
-                    // dispatch call; drop it on return so the queue cannot
-                    // accumulate one entry per keystroke.
-                    EVENT_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                    notify_if_changed(changed.max(take_input_dirty()), || cx.notify());
+                    notify_if_changed(dispatch_event_text(view, &text).max(take_input_dirty()), || {
+                        cx.notify();
+                    });
                 }
             }));
         if let Some(node) = &root {
@@ -3319,7 +3725,12 @@ impl Render for FfiView {
                 d = d.child(el);
             }
         }
-        let element = d.into_any_element();
+        let element = ImeBridgeProbe {
+            child: d.into_any_element(),
+            view: self.view as i32,
+            focus: self.focus.clone(),
+        }
+        .into_any_element();
         if benchmark_window_active() {
             BenchmarkFrameProbe { child: element }.into_any_element()
         } else {
@@ -4005,6 +4416,20 @@ fn render_node_inner(
                     }
                     (None, false) => Some(d.into_any_element()),
                 },
+            };
+            // Caret anchor (app contract): a div keyed "caret" is the app's
+            // drawn caret; wrap it so its window-space rect feeds the IME
+            // candidate anchor (see `IME_CARET_BOUNDS`).
+            let el = if key.as_deref() == Some("caret") {
+                el.map(|child| {
+                    CaretBoundsProbe {
+                        child,
+                        view: view_id,
+                    }
+                    .into_any_element()
+                })
+            } else {
+                el
             };
             // Scroll feedback subscription (issue #89): wrap the subscribed
             // div so the settled offset is observed after every paint. Only a

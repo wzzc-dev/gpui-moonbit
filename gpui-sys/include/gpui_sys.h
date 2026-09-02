@@ -274,4 +274,12 @@ int32_t gpui_input_set_text(int32_t view, int32_t input_id, const uint8_t *ptr, 
  */
 int32_t gpui_scroll_copy_state(int32_t view, int32_t scroll_id, uint8_t *buf, int32_t len);
 
+extern const void *TISCopyCurrentKeyboardInputSource(void);
+
+extern const void *TISGetInputSourceProperty(const void *source, const void *property_key);
+
+extern uint8_t CFEqual(const void *cf1, const void *cf2);
+
+extern void CFRelease(const void *cf);
+
 #endif  /* GPUI_SYS_H */

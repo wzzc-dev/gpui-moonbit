@@ -8,6 +8,12 @@
 
 ### Added
 
+- **App-level IME bridge for custom-drawn editors**（自绘编辑器的 IME 修复，md_mbt 消费者需求）: 从不提交 `OP_TEXT_INPUT` 的应用（`rich_text` + 应用级键处理的编辑器）窗口内没有 input handler，macOS IME 的 `NSTextInputClient` 查询全部落空——组词无法登记、提交被丢弃、raw 拼音字母已被当作 `EVENT_TEXT` 插入。gpui-sys 以纯附加方式补齐（`ABI_VERSION` 据置、既存 opcode/事件信封不变）:
+  - `ImeBridge`（实现 gpui `InputHandler`）经 `ImeBridgeProbe` 包装元素在每次 paint 时 `Window::handle_input` 注册；marked range 存 `IME_MARKED` 静态表（重注册不丢组合状态），真实 text-input widget 的 paint 注册随后覆盖（RFC 0003 行为不变）。
+  - 提交（`replace_text_in_range`）→ `EVENT_TEXT`（与普通键入同一载荷路径）；组词更新/取消 → `EVENT_ASYNC`（`0xEE` 标记 + UTF-8 组合文本，app 私有契约）；派发后 `window.refresh()` 请求重绘。
+  - 根 on_key_down 的按键分流：TIS 查询当前输入源为输入法（`com.apple.inputmethod.` 前缀）且无 Ctrl/Cmd/Fn 修饰的可打印键不向 MoonBit 派发（mac 窗口转交 NSInputContext），同时补发未知 named-key（id 0）维持消费者侧 swallow 代际；纯布局（ABC）行为完全不变。
+- `dispatch_event_text(view, text)` 共享辅助：EVENT_QUEUE token+copy + 同步 mb_dispatch + #70 清队，键路径与 IME 提交共用。
+
 - dispatch のランタイム登録 API `register_dispatch` / `dispatch_entry`（#125、RFC 0004 §3、実装計画の 1・2 段目）。Rust がリンクする唯一のコールバックシンボルをライブラリ本体が所有し（`dispatch_entry`、ルートパッケージ `nakake/gpui-bindings`）、アプリは起動時に `register_dispatch(dispatch)` で自分の dispatch を差し込む。`dispatch_entry` は `Ref` に保持したクロージャへの純粋委譲で、version 解釈やイベント配送は従来どおり `framework_dispatch` の責務。再登録は last-wins（テストが dispatch を差し替える正規の手段）。未登録のまま呼ばれた場合は `0`（変化なし）を返して初回のみ警告を 1 行出す（`abort` にしないのは、dispatch を必要としないヘッドレスビルドを動かし続けるため。完全無音にしないのは、`EVENT_ASYNC` が dispatch 復帰後にキューを clear するため register 忘れが「イベントが消える」形で現れるため）。出力先は stdout — MoonBit core に stderr へ書く API が無く、fd 2 に届かせるには新規 C エクスポートかルートパッケージへの native stub が必要で、警告 1 行のために公開ビルド面を増やす取引に見合わないと判断した（RFC 0004 §3.3 / §8-1）。
 
 - テキスト入力 widget と IME 合成の実装（#88、RFC 0003、G6 / G19）:
