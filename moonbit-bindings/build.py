@@ -201,11 +201,11 @@ def msvc_path(path):
     return p
 
 
-def cargo_build(gpui_sys, rust_target):
+def cargo_build(gpui_sys, rust_target, cargo_profile):
     """Build gpui-sys with `cargo build`. Logs and exits on failure."""
     log("building gpui-sys...")
     result = run(
-        ["cargo", "build", "--target", rust_target],
+        ["cargo", "build", "--target", rust_target, *cargo_profile],
         cwd=gpui_sys,
         capture_output=True,
         text=True,
@@ -216,12 +216,12 @@ def cargo_build(gpui_sys, rust_target):
         sys.exit(1)
 
 
-def extract_native_libs(gpui_sys, rust_target):
+def extract_native_libs(gpui_sys, rust_target, cargo_profile):
     """Capture cargo's native-static-libs list. Logs and exits on failure."""
     log("extracting native-static-libs...")
     result = run(
         [
-            "cargo", "rustc", "--target", rust_target,
+            "cargo", "rustc", "--target", rust_target, *cargo_profile,
             "--lib", "--crate-type", "staticlib",
             "--", "--print", "native-static-libs",
         ],
@@ -315,6 +315,21 @@ def main():
             os.environ["RUSTFLAGS"] = (existing + " " + flag).strip() if existing else flag
         log(f"RUSTFLAGS={os.environ['RUSTFLAGS']}")
 
+    # --- cargo profile ---
+    # Windows must build gpui-sys with `--release`: gpui's debug profile
+    # (`debug_assertions`) does not embed the precompiled shader bytes and
+    # instead compiles the HLSL at runtime from the *build machine's* source
+    # tree (`D3DCompileFromFile` + `CARGO_MANIFEST_DIR`). A debug-built binary
+    # run on any other machine therefore dies at startup with
+    # "Error creating DirectWriteTextSystem". Release embeds the shader bytes
+    # (built by gpui's build.rs via fxc) and the artifact is self-contained.
+    if os_pkg == "windows":
+        cargo_profile = ["--release"]
+        profile_dir = "release"
+    else:
+        cargo_profile = []
+        profile_dir = "debug"
+
     # --- Determine the Rust library directory ---
     result = run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
@@ -325,7 +340,7 @@ def main():
     )
     metadata = json.loads(result.stdout)
     target_dir = metadata["target_directory"]
-    rust_lib_dir = os.path.join(target_dir, rust_target, "debug")
+    rust_lib_dir = os.path.join(target_dir, rust_target, profile_dir)
     log(f"rust lib dir: {rust_lib_dir}")
 
     # --- Build gpui-sys / extract native-static-libs ---
@@ -334,15 +349,15 @@ def main():
     # rustc exits after printing without producing output), so running
     # `cargo build` last guarantees gpui_sys.lib exists for moon's link step.
     if os_pkg == "windows":
-        native_libs_line = extract_native_libs(gpui_sys, rust_target)
-        cargo_build(gpui_sys, rust_target)
+        native_libs_line = extract_native_libs(gpui_sys, rust_target, cargo_profile)
+        cargo_build(gpui_sys, rust_target, cargo_profile)
         gpui_sys_lib = os.path.join(rust_lib_dir, "gpui_sys.lib")
         if not os.path.exists(gpui_sys_lib):
             log(f"ERROR: {gpui_sys_lib} not found after cargo build")
             sys.exit(1)
     else:
-        cargo_build(gpui_sys, rust_target)
-        native_libs_line = extract_native_libs(gpui_sys, rust_target)
+        cargo_build(gpui_sys, rust_target, cargo_profile)
+        native_libs_line = extract_native_libs(gpui_sys, rust_target, cargo_profile)
 
     # --- Normalize per-OS ---
     normalized = normalize_native_libs(native_libs_line, os_pkg)
