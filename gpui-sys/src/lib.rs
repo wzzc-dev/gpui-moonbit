@@ -3540,6 +3540,9 @@ impl InputHandler for ImeBridge {
     }
 }
 
+// TIS/Carbon 查询是 macOS 独有的 IME 探测路径；`kind = "framework"` 在非
+// Apple 目标上直接是编译错误（E0455），故整段按平台门控。
+#[cfg(target_os = "macos")]
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     fn TISCopyCurrentKeyboardInputSource() -> *const std::ffi::c_void;
@@ -3552,6 +3555,7 @@ unsafe extern "C" {
     static kTISTypeKeyboardInputMethodWithoutModes: *const std::ffi::c_void;
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFEqual(cf1: *const std::ffi::c_void, cf2: *const std::ffi::c_void) -> u8;
@@ -3569,6 +3573,7 @@ unsafe extern "C" {
 /// not com.apple.* (Sogou, WeType, ...); their printable keystrokes then
 /// reach BOTH the app (typed_text → EVENT_TEXT) and the IME (commit →
 /// EVENT_TEXT), double-inserting every letter and digit.
+#[cfg(target_os = "macos")]
 fn ime_input_source_active() -> bool {
     unsafe {
         let source = TISCopyCurrentKeyboardInputSource();
@@ -3582,6 +3587,13 @@ fn ime_input_source_active() -> bool {
         CFRelease(source);
         active
     }
+}
+
+/// Non-macOS: no TIS input-source notion, so never report a composing
+/// source. The IME passthrough branch at the single call site stays inert.
+#[cfg(not(target_os = "macos"))]
+fn ime_input_source_active() -> bool {
+    false
 }
 
 pub struct FfiView {
