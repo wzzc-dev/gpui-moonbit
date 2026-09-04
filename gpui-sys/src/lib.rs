@@ -3596,6 +3596,30 @@ fn ime_input_source_active() -> bool {
     false
 }
 
+/// Physical state of the Alt key (VK_MENU) at dispatch time. Windows uses
+/// this to tell plain keystrokes (translated to WM_CHAR, text delivered via
+/// the ImeBridge) from Alt/AltGr combos (WM_SYSKEYDOWN, no char message —
+/// their typed text only exists on the keydown path). A direct `user32`
+/// import: gpui links user32 into the final executable anyway, and adding a
+/// `windows` dependency here would drag a version-matched crate into the
+/// staticlib for one function.
+#[cfg(windows)]
+fn alt_key_pressed() -> bool {
+    const VK_MENU: i32 = 0x12;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetKeyState(nVirtKey: i32) -> i16;
+    }
+    // High bit of GetKeyState means "currently down"; the return is SHORT,
+    // so a down state reads negative.
+    unsafe { GetKeyState(VK_MENU) < 0 }
+}
+
+#[cfg(not(windows))]
+fn alt_key_pressed() -> bool {
+    false
+}
+
 pub struct FfiView {
     focus: FocusHandle,
     /// Index into `VIEWS` whose committed tree this view renders.
@@ -3782,10 +3806,28 @@ impl Render for FfiView {
                 // (including multi-char keys and IME-composed text). The
                 // payload lives in EVENT_QUEUE; MoonBit copies it via
                 // gpui_event_copy_text during the synchronous dispatch.
+                //
+                // Windows suppresses this for plain keystrokes: the platform
+                // backend runs TranslateMessage on every unhandled
+                // WM_KEYDOWN, and the resulting WM_CHAR calls
+                // `replace_text_in_range` on the focused ImeBridge — which
+                // emits its own EVENT_TEXT with the same character. Emitting
+                // `key_char` here as well double-inserted every letter and
+                // digit (the same duplicate the mac third-party-IME case
+                // produced, unconditional here). WM_CHAR is the authoritative
+                // text path on Windows: layout-aware, dead-key aware, control
+                // chars filtered. Alt/AltGr combos arrive as WM_SYSKEYDOWN,
+                // which the backend does not translate into a char message,
+                // so their key_char remains the only text source and keeps
+                // flowing through this path.
+                let wm_char_will_deliver = cfg!(windows) && !alt_key_pressed();
                 if let Some(text) = typed_text(ev) {
-                    notify_if_changed(dispatch_event_text(view, &text).max(take_input_dirty()), || {
-                        cx.notify();
-                    });
+                    if !wm_char_will_deliver {
+                        notify_if_changed(
+                            dispatch_event_text(view, &text).max(take_input_dirty()),
+                            || cx.notify(),
+                        );
+                    }
                 }
             }))
             // Mouse input for the app's own drag selection: left-button
