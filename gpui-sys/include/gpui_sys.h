@@ -283,12 +283,20 @@ int32_t gpui_scroll_copy_state(int32_t view, int32_t scroll_id, uint8_t *buf, in
  */
 int32_t gpui_probe_rect(const uint8_t *buf, int32_t len, uint8_t *out);
 
+#if defined(__APPLE__)
 extern const void *TISCopyCurrentKeyboardInputSource(void);
+#endif
 
+#if defined(__APPLE__)
 extern const void *TISGetInputSourceProperty(const void *source, const void *property_key);
+#endif
 
+#if defined(__APPLE__)
 extern uint8_t CFEqual(const void *cf1, const void *cf2);
+#endif
 
+#if defined(__APPLE__)
 extern void CFRelease(const void *cf);
+#endif
 
 #endif  /* GPUI_SYS_H */
