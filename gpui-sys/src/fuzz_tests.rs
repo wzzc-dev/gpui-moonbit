@@ -17,8 +17,8 @@ use crate::abi_constants::{
     OP_SET_FONT_WEIGHT, OP_SET_GAP, OP_SET_INSET, OP_SET_KEY, OP_SET_LINE_HEIGHT, OP_SET_MARGIN,
     OP_SET_MAX_SIZE, OP_SET_MIN_SIZE, OP_SET_ON_CLICK, OP_SET_OPACITY, OP_SET_OVERFLOW,
     OP_SET_PADDING, OP_SET_PADDING_SIDES, OP_SET_POSITION, OP_SET_ROOT, OP_SET_ROUNDED,
-    OP_SET_SHADOW, OP_SET_SIZE, OP_SET_TEXT_ALIGN, OP_SET_TEXT_COLOR, OP_SET_TEXT_SIZE,
-    OP_SET_WHITESPACE, OP_TEXT, OP_TEXT_RUN,
+    OP_SET_SHADOW, OP_SET_SIZE, OP_SET_TEXT_ALIGN, OP_SET_TEXT_COLOR, OP_SET_TEXT_ROW,
+    OP_SET_TEXT_SIZE, OP_SET_WHITESPACE, OP_TEXT, OP_TEXT_RUN,
 };
 use crate::{
     GPUI_STATUS_BAD_BUFFER_VERSION, GPUI_STATUS_DEPTH_EXCEEDED, GPUI_STATUS_DUPLICATE_KEY,
@@ -77,7 +77,7 @@ impl Rng {
 }
 
 /// Every real opcode, so the structured generator exercises all decode arms.
-const OPCODES: [i32; 35] = [
+const OPCODES: [i32; 36] = [
     OP_DIV,
     OP_TEXT,
     OP_TEXT_RUN,
@@ -111,6 +111,7 @@ const OPCODES: [i32; 35] = [
     OP_SET_TEXT_ALIGN,
     OP_SET_WHITESPACE,
     OP_SET_FONT_FAMILY,
+    OP_SET_TEXT_ROW,
     OP_ADD_CHILD,
     OP_SET_ROOT,
 ];
@@ -155,6 +156,16 @@ fn emit_operands(rng: &mut Rng, buf: &mut Vec<u8>, opcode: i32) {
             let len = rng.below(64);
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&rng.bytes(len as usize));
+            return;
+        }
+        // key_len u32 + key bytes + has_caret u8 + byte_offset u32 + rgb + blink u8.
+        // Random operands almost never validate against a real text node, so
+        // this mostly exercises the INVALID_TEXT_RUN rejection path.
+        OP_SET_TEXT_ROW => {
+            let len = rng.below(64);
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&rng.bytes(len as usize));
+            buf.extend_from_slice(&rng.bytes(9));
             return;
         }
         _ => unreachable!("OPCODES is exhaustive"),

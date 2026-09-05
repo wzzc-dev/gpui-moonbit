@@ -283,6 +283,32 @@ int32_t gpui_scroll_copy_state(int32_t view, int32_t scroll_id, uint8_t *buf, in
  */
 int32_t gpui_probe_rect(const uint8_t *buf, int32_t len, uint8_t *out);
 
+/**
+ * Pull ABI: the window-space position of a character within a keyed text row
+ * as painted in the LAST frame. `buf`/`len` carry the ASCII key bytes (the
+ * same string as the row's `OP_SET_TEXT_ROW`); `char_index` counts Unicode
+ * characters (MoonBit's model), where the row's char count means the row-end
+ * insertion point. On a hit writes `(x, y)` as two 1/4-pixel fixed-point LE
+ * i32s into `out` (8 bytes, caller pre-zeroed) and returns 0; -1 on a miss
+ * (never painted this frame-chain, char past the end).
+ */
+int32_t gpui_text_x_for_char(const uint8_t *buf, int32_t len, int32_t char_index, uint8_t *out);
+
+/**
+ * Pull ABI: the inverse of `gpui_text_x_for_char` — the character index
+ * nearest a window-space point in a keyed text row from the LAST painted
+ * frame. `x`/`y` are 1/4-pixel fixed-point i32 (integer pixels × 4). gpui's
+ * nearest-line semantics apply: a point past the end of a row's text yields
+ * that line's end offset, which is what click placement wants. On a hit
+ * writes the LE i32 char index into `out` (4 bytes, pre-zeroed) and returns
+ * 0; -1 on a miss.
+ */
+int32_t gpui_text_char_for_position(const uint8_t *buf,
+                                    int32_t len,
+                                    int32_t x,
+                                    int32_t y,
+                                    uint8_t *out);
+
 #if defined(__APPLE__)
 extern const void *TISCopyCurrentKeyboardInputSource(void);
 #endif

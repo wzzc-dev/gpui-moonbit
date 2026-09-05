@@ -74,3 +74,22 @@ extern "C" fn gpui_scroll_copy_state_ffi(
   buf : Bytes,
   len : Int,
 ) -> Int = "gpui_scroll_copy_state"
+
+///|
+#borrow(buf, out)
+extern "C" fn gpui_text_x_for_char_ffi(
+  buf : Bytes,
+  len : Int,
+  char_index : Int,
+  out : Bytes,
+) -> Int = "gpui_text_x_for_char"
+
+///|
+#borrow(buf, out)
+extern "C" fn gpui_text_char_for_position_ffi(
+  buf : Bytes,
+  len : Int,
+  x : Int,
+  y : Int,
+  out : Bytes,
+) -> Int = "gpui_text_char_for_position"

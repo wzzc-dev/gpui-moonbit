@@ -737,3 +737,62 @@ test "rich_text with no styled segments emits no runs" {
     assert_eq(a[i], b[i])
   }
 }
+
+// --- set_text_row wire format (text-row ABI) -----------------------------------
+//
+// OP_SET_TEXT_ROW is ABI-frozen at 41:
+// opcode u8 | key_len u32 LE | key bytes | has_caret u8 | byte_offset u32 LE |
+// r,g,b u8x3 | blink u8. The writer owns the char → UTF-8 byte conversion.
+
+///|
+test "set_text_row wire format matches the Rust decoder layout" {
+  let cb = CommandBuffer::new()
+  // "aあb": 3 chars, 5 UTF-8 bytes (1+3+1). Caret at char 2 → byte 4.
+  cb.text("aあb", 0, 0, 0, 1.0)
+  cb.set_text_row("probe:r1", "aあb", 2, 10, 20, 30, true)
+  cb.set_root()
+  let b = cb.to_bytes()
+  // OP_TEXT: opcode@8, len@9-12 (=5), "aあb"@13-17, rgb@18-20, f32@21-24.
+  assert_eq(b[8].to_int(), OP_TEXT)
+  assert_eq(read_u32_le(b, 9), 5)
+  // OP_SET_TEXT_ROW starts at byte 25.
+  assert_eq(b[25].to_int(), OP_SET_TEXT_ROW)
+  assert_eq(read_u32_le(b, 26), 8) // len("probe:r1")
+  assert_eq(b[30], b'p')
+  assert_eq(b[37], b'1')
+  assert_eq(b[38].to_int(), 1) // has_caret
+  assert_eq(read_u32_le(b, 39), 4) // char 2 of "aあb" == byte 4
+  assert_eq(b[43].to_int(), 10)
+  assert_eq(b[44].to_int(), 20)
+  assert_eq(b[45].to_int(), 30)
+  assert_eq(b[46].to_int(), 1) // blink
+  assert_eq(b[47].to_int(), OP_SET_ROOT)
+  assert_eq(b.length(), 48)
+}
+
+///|
+test "set_text_row without caret zeroes the caret slots" {
+  let cb = CommandBuffer::new()
+  cb.text("ab", 0, 0, 0, 1.0)
+  cb.set_text_row("k", "ab", -1, 1, 2, 3, false)
+  let b = cb.to_bytes()
+  // OP_TEXT: opcode@8, len@9-12, "ab"@13-14, rgb@15-17, f32@18-21.
+  assert_eq(b[22].to_int(), OP_SET_TEXT_ROW)
+  assert_eq(read_u32_le(b, 23), 1) // len("k")
+  assert_eq(b[27], b'k') // key bytes 27
+  assert_eq(b[28].to_int(), 0) // has_caret
+  assert_eq(read_u32_le(b, 29), 0) // inert offset slot
+  assert_eq(b[36].to_int(), 0) // blink
+  assert_eq(b.length(), 37) // ... + rgb(3) at 33-35 + blink(1)
+}
+
+///|
+test "set_text_row clamps caret_char past the end to the row end" {
+  let cb = CommandBuffer::new()
+  cb.text("ab", 0, 0, 0, 1.0)
+  cb.set_text_row("k", "ab", 9, 0, 0, 0, false)
+  let b = cb.to_bytes()
+  assert_eq(b[22].to_int(), OP_SET_TEXT_ROW)
+  assert_eq(b[28].to_int(), 1) // has_caret stays 1
+  assert_eq(read_u32_le(b, 29), 2) // clamped to byte offset 2 == row end
+}

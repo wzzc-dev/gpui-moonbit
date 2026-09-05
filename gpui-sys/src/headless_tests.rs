@@ -16,8 +16,8 @@
 use crate::headless::{assert_bounds_eq, layout_bound, layout_bounds};
 use crate::abi_constants::{ALIGN_START, BUFFER_VERSION, JUSTIFY_DEFAULT, OP_ADD_CHILD, OP_DIV,
     OP_SET_ALIGN, OP_SET_BORDER, OP_SET_FLEX, OP_SET_GAP, OP_SET_KEY, OP_SET_PADDING,
-    OP_SET_ROOT, OP_SET_ROUNDED, OP_SET_SIZE, OP_TEXT, OP_TEXT_RUN, RUN_STYLE_COLOR,
-    RUN_STYLE_WEIGHT};
+    OP_SET_ROOT, OP_SET_ROUNDED, OP_SET_SIZE, OP_SET_TEXT_ROW, OP_TEXT, OP_TEXT_RUN,
+    RUN_STYLE_COLOR, RUN_STYLE_WEIGHT};
 use crate::{GPUI_STATUS_BAD_BUFFER_VERSION, GPUI_STATUS_INVALID_FLOAT};
 use gpui::TestAppContext;
 
@@ -640,4 +640,126 @@ mod text_input_interaction {
             .count();
         assert_eq!(text_events, 2, "both keys leaked to the app");
     }
+}
+
+// ---------------------------------------------------------------------
+// OP_SET_TEXT_ROW — the metrics mirror + painted caret.
+//
+// NoopTextSystem determinism (see module header): glyph advance 600/1000·size,
+// so at 20px each character — including "あ" — occupies exactly 12px.
+// ---------------------------------------------------------------------
+
+/// Render a row-declared text node and pull its mirrored layout through both
+/// metric exports; also assert the caret rect reached the IME anchor key
+/// (`PROBE_BOUNDS["caret"]`). Character indices are MoonBit's unit, so the
+/// multibyte content pins the char↔byte conversion inside the exports.
+#[gpui::test]
+fn text_row_metrics_and_caret_roundtrip(cx: &mut TestAppContext) {
+    let content = "aあbc"; // bytes: a=0, あ=1..4, b=4, c=5; len 6
+    let buf = Buf::new()
+        .div()
+        // The adapter emits this as the root's first child every frame;
+        // exercising it here pins that the mirrors survive the clear.
+        .div()
+        .key("probe:clear")
+        .add_child()
+        .div()
+        .key("row")
+        .op(OP_TEXT)
+        .u32(content.len() as u32)
+        .bytes(content.as_bytes())
+        .u8(0)
+        .u8(0)
+        .u8(0)
+        .f32(20.0)
+        // Caret at char 2 ("b" → byte 4), static (blink = 0) for determinism.
+        .op(OP_SET_TEXT_ROW)
+        .u32(3)
+        .bytes(b"row")
+        .u8(1)
+        .u32(4)
+        .u8(10)
+        .u8(20)
+        .u8(30)
+        .u8(0)
+        .add_child() // text -> row
+        .add_child() // row -> root
+        .root()
+        .finish();
+    layout_bound(cx, &buf, "row").expect("decode");
+
+    let key = b"row";
+    let x_for_char = |idx: i32| -> Option<(f32, f32)> {
+        let mut out = [0u8; 8];
+        if crate::gpui_text_x_for_char(key.as_ptr(), key.len() as i32, idx, out.as_mut_ptr()) != 0
+        {
+            return None;
+        }
+        let quarter = |i: usize| -> f32 {
+            i32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap()) as f32 / 4.0
+        };
+        Some((quarter(0), quarter(1)))
+    };
+    let (x0, y0) = x_for_char(0).expect("char 0");
+    let (x1, _) = x_for_char(1).expect("char 1 (multibyte start)");
+    let (x2, y2) = x_for_char(2).expect("char 2");
+    let (x3, _) = x_for_char(3).expect("char 3");
+    let (x4, _) = x_for_char(4).expect("char count == row-end insertion point");
+    assert_eq!(x_for_char(5), None, "char past the end must miss");
+    assert_eq!(
+        crate::gpui_text_x_for_char(
+            b"never-painted".as_ptr(),
+            13,
+            0,
+            [0u8; 8].as_mut_ptr()
+        ),
+        -1,
+        "unknown key must miss"
+    );
+    for (label, a, b) in [("0→1", x0, x1), ("1→2", x1, x2), ("2→3", x2, x3), ("3→end", x3, x4)] {
+        assert!(
+            (b - a - 12.0).abs() < 0.26,
+            "{label}: expected one 12px glyph, got {:.3}",
+            b - a
+        );
+    }
+    assert_eq!(y0, y2, "single wrapped line shares y");
+
+    let char_at = |x: f32, y: f32| -> Option<i32> {
+        let mut out = [0u8; 4];
+        let status = crate::gpui_text_char_for_position(
+            key.as_ptr(),
+            key.len() as i32,
+            (x * 4.0).round() as i32,
+            (y * 4.0).round() as i32,
+            out.as_mut_ptr(),
+        );
+        (status == 0).then(|| i32::from_le_bytes(out))
+    };
+    // Mid-glyph clicks land on the exact character (the whole point:
+    // proportional fonts must not fall back to linear interpolation).
+    assert_eq!(char_at(x0 + 6.0, y0), Some(0));
+    assert_eq!(char_at(x1 + 6.0, y0), Some(1));
+    assert_eq!(char_at(x2 + 6.0, y2), Some(2));
+    // gpui's nearest-line semantics: far right clamps to the row end, far
+    // left / above land at 0.
+    assert_eq!(char_at(x4 + 200.0, y0), Some(4));
+    assert_eq!(char_at(x0 - 500.0, y0), Some(0));
+    assert_eq!(char_at(x2, y0 - 500.0), Some(0));
+
+    // The caret rect rode into the IME anchor key during prepaint — the
+    // exact position `position_for_index(char 2)` produced.
+    let mut probe = [0u8; 16];
+    assert_eq!(
+        crate::gpui_probe_rect(b"caret".as_ptr(), 5, probe.as_mut_ptr()),
+        0,
+        "the caret must publish its rect under the IME anchor key"
+    );
+    let caret_x = i32::from_le_bytes(probe[0..4].try_into().unwrap()) as f32;
+    let caret_w = i32::from_le_bytes(probe[8..12].try_into().unwrap()) as f32;
+    assert!(
+        (caret_x - x2).abs() < 1.0,
+        "caret x {caret_x} must sit at char 2's x {x2}"
+    );
+    assert_eq!(caret_w, 2.0, "caret is the 2px bar");
 }

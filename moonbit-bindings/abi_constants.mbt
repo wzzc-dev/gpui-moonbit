@@ -202,6 +202,9 @@ pub const OP_TEXT_RUN : Int = 39
 pub const OP_SET_SCROLL_ID : Int = 40
 
 ///|
+pub const OP_SET_TEXT_ROW : Int = 41
+
+///|
 pub const ALIGN_DEFAULT : Int = 0
 
 ///|

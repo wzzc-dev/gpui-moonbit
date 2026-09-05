@@ -380,6 +380,52 @@ pub fn CommandBuffer::rich_text(
 }
 
 ///|
+/// 直前にプッシュしたテキストノードを「計測行」として宣言します（text-row ABI）。
+/// `rich_text` / `text` の後、`add_child` の前に呼びます。
+///
+/// - `key`: 行のプローブ div と同じキー。Rust 側はこのキーで前フレームのレイアウトを
+///   保管し、`gpui_text_x_for_char` / `gpui_text_char_for_position` の pull ABI が
+///   文字単位の正確なヒットテストに使います。
+/// - `content`: そのテキストノードの全文（`rich_text` の連結結果）。文字 index →
+///   UTF-8 バイト offset の変換に使います。
+/// - `caret_char`: 0 以上ならその**文字** index（文字数と等しければ行末）にキャレットを
+///   Rust 側が描画します。-1 はキャレットなし（計測のみ）。
+/// - `r` / `g` / `b`: キャレット色（0–255 にクランプ）。
+/// - `blink`: true で点滅（ツリー再構築後 0.5 秒常灯 → コサイン減衰、velotype と同一曲線）。
+pub fn CommandBuffer::set_text_row(
+  self : CommandBuffer,
+  key : String,
+  content : String,
+  caret_char : Int,
+  r : Int,
+  g : Int,
+  b : Int,
+  blink : Bool,
+) -> Unit {
+  self.op(OP_SET_TEXT_ROW)
+  self.write_str(key)
+  if caret_char < 0 {
+    // キャレットなし：オフセットスロットは inert（Rust 側も検証しない）。
+    self.buf.write_byte(0)
+    self.buf.write_uint_le(0)
+  } else {
+    self.buf.write_byte(1)
+    let n = if caret_char > content.length() {
+      content.length()
+    } else {
+      caret_char
+    }
+    self.buf.write_uint_le(
+      to_utf8_bytes(content[0:n].to_owned()).length().reinterpret_as_uint(),
+    )
+  }
+  self.buf.write_byte(clamp_color_component(r).to_byte())
+  self.buf.write_byte(clamp_color_component(g).to_byte())
+  self.buf.write_byte(clamp_color_component(b).to_byte())
+  self.buf.write_byte(if blink { 1 } else { 0 })
+}
+
+///|
 /// 新しいテキスト入力 widget をプッシュします（RFC 0003、issue #88）。`OP_TEXT` と同じく
 /// leaf ノードで、`add_child` で親 div に接続します。`input_id` は `HandlerRegistry::
 /// new_input_id` で発行した型付き id の raw 値で、envelope（`EVENT_INPUT_CHANGED` /
@@ -1095,6 +1141,70 @@ pub fn scroll_state(view : Int, scroll_id : Int) -> Result[ScrollState, Int] {
     viewport_w: read_f32_le(buf, 16),
     viewport_h: read_f32_le(buf, 20),
   })
+}
+
+// --- Text row metrics pull API -------------------------------------------------
+//
+// Both pulls read the LAST painted frame's mirrored layout for the
+// `set_text_row` key (mirror-then-pull: call them after the frame containing
+// the row has been drawn, i.e. from inside an event dispatch). Positions are
+// window coordinates; the fixed-point (1/4 px) wire encoding is decoded here.
+
+///|
+fn read_le_i32(b : Bytes, offset : Int) -> Int {
+  let u = b[offset].to_int() |
+    (b[offset + 1].to_int() << 8) |
+    (b[offset + 2].to_int() << 16) |
+    (b[offset + 3].to_int() << 24)
+  u.reinterpret_as_uint().reinterpret_as_int()
+}
+
+///|
+/// 1/4 px 固定小数点 LE i32 2 つ（x, y）を Float の組にデコードする。
+fn read_fixed_px_pair(b : Bytes, offset : Int) -> (Float, Float) {
+  (
+    Float::from_int(read_le_i32(b, offset)) / 4.0,
+    Float::from_int(read_le_i32(b, offset + 4)) / 4.0,
+  )
+}
+
+///|
+/// `set_text_row` で宣言したキー `key` のテキスト行について、直前描画フレームの
+/// レイアウトから `char_index` 文字目（文字単位、文字数で行末）のウィンドウ座標を
+/// 読み戻す。ヒットで `Some((x, y))`、未描画・範囲外などで `None`（text-row ABI）。
+pub fn text_x_for_char(key : String, char_index : Int) -> (Float, Float)? {
+  let key_bytes = to_utf8_bytes(key)
+  let out = Bytes::make(8, b'\x00')
+  let n = gpui_text_x_for_char_ffi(
+    key_bytes,
+    key_bytes.length(),
+    char_index,
+    out,
+  )
+  if n < 0 {
+    return None
+  }
+  Some(read_fixed_px_pair(out, 0))
+}
+
+///|
+/// `text_x_for_char` の逆引き：ウィンドウ座標 (x, y) に最も近い文字 index を
+/// 読み戻す（折り返し行の末尾クリックはその行の末尾になる、gpui の最近傍意味論）。
+/// ヒットで `Some(index)`、未描画などなら `None`（text-row ABI）。
+pub fn text_char_for_position(key : String, x : Float, y : Float) -> Int? {
+  let key_bytes = to_utf8_bytes(key)
+  let out = Bytes::make(4, b'\x00')
+  let n = gpui_text_char_for_position_ffi(
+    key_bytes,
+    key_bytes.length(),
+    (x * 4.0).round().to_int(),
+    (y * 4.0).round().to_int(),
+    out,
+  )
+  if n < 0 {
+    return None
+  }
+  Some(read_le_i32(out, 0))
 }
 
 // --- Diagnostics (issue #54, G21) ------------------------------------------

@@ -179,6 +179,8 @@ pub const OP_SET_TEXT_ALIGN : Int = 32
 
 pub const OP_SET_TEXT_COLOR : Int = 29
 
+pub const OP_SET_TEXT_ROW : Int = 41
+
 pub const OP_SET_TEXT_SIZE : Int = 28
 
 pub const OP_SET_WHITESPACE : Int = 33
@@ -253,6 +255,8 @@ pub fn expect_ok(Result[Unit, Int], String) -> Unit
 
 pub fn framework_dispatch(RenderCtx, Int, Int, Int, Int, Int, (Int) -> Result[Unit, Int]) -> Int
 
+pub fn framework_dispatch_with_patch(RenderCtx, Int, Int, Int, Int, Int, (Int) -> Bool, (Int) -> Result[Unit, Int]) -> Int
+
 pub fn input_set_text(Int, Int, String) -> Result[Unit, Int]
 
 pub fn input_text(Int, Int) -> Result[String, Int]
@@ -269,7 +273,11 @@ pub fn scroll_state(Int, Int) -> Result[ScrollState, Int]
 
 pub fn status_message(Int) -> String
 
+pub fn text_char_for_position(String, Float, Float) -> Int?
+
 pub fn text_input(CommandBuffer, TextInputProps) -> Unit
+
+pub fn text_x_for_char(String, Int) -> (Float, Float)?
 
 pub fn update_text(Int, String, String) -> Result[Unit, Int]
 
@@ -344,6 +352,7 @@ pub fn CommandBuffer::set_tab_index(Self, Int) -> Unit
 pub fn CommandBuffer::set_tab_stop(Self, Int) -> Unit
 pub fn CommandBuffer::set_text_align(Self, Int) -> Unit
 pub fn CommandBuffer::set_text_color(Self, Color) -> Unit
+pub fn CommandBuffer::set_text_row(Self, String, String, Int, Int, Int, Int, Bool) -> Unit
 pub fn CommandBuffer::set_text_size(Self, Int) -> Unit
 pub fn CommandBuffer::set_whitespace(Self, Int) -> Unit
 pub fn CommandBuffer::text(Self, String, Int, Int, Int, Float) -> Unit

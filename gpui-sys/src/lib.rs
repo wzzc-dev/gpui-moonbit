@@ -35,8 +35,8 @@ use abi_constants::{
     OP_SET_OPACITY, OP_SET_OVERFLOW, OP_SET_PADDING, OP_SET_PADDING_SIDES, OP_SET_POSITION,
     OP_SET_ROOT, OP_SET_ROUNDED, OP_SET_SCROLL_ID, OP_SET_SHADOW, OP_SET_SIZE, OP_SET_TAB_INDEX,
     OP_SET_TAB_STOP,
-    OP_SET_TEXT_ALIGN, OP_SET_TEXT_COLOR, OP_SET_TEXT_SIZE, OP_SET_WHITESPACE, OP_TEXT,
-    OP_TEXT_INPUT, OP_TEXT_RUN, OVERFLOW_HIDDEN, OVERFLOW_SCROLL, OVERFLOW_VISIBLE,
+    OP_SET_TEXT_ALIGN, OP_SET_TEXT_COLOR, OP_SET_TEXT_ROW, OP_SET_TEXT_SIZE, OP_SET_WHITESPACE,
+    OP_TEXT, OP_TEXT_INPUT, OP_TEXT_RUN, OVERFLOW_HIDDEN, OVERFLOW_SCROLL, OVERFLOW_VISIBLE,
     POSITION_ABSOLUTE, POSITION_RELATIVE, RUN_STYLE_BACKGROUND, RUN_STYLE_COLOR,
     RUN_STYLE_ITALIC, RUN_STYLE_STRIKETHROUGH, RUN_STYLE_UNDERLINE, RUN_STYLE_WEIGHT,
     TEXT_ALIGN_CENTER, TEXT_ALIGN_DEFAULT, TEXT_ALIGN_JUSTIFY, TEXT_ALIGN_LEFT,
@@ -661,6 +661,28 @@ struct TextRunSpec {
     background: (u8, u8, u8, u8),
 }
 
+/// Caret declaration inside `OP_SET_TEXT_ROW`: a Rust-painted insertion caret
+/// at a validated UTF-8 byte offset into the owning text node's content.
+/// `blink` selects the velotype-style fade (full for 0.5 s after the epoch
+/// reset, then a cosine); the epoch resets on every tree commit that carries a
+/// blinking caret, i.e. on every keystroke/click/move rebuild.
+#[derive(Clone, PartialEq, Debug)]
+struct CaretSpec {
+    byte_offset: usize,
+    color: (u8, u8, u8),
+    blink: bool,
+}
+
+/// Row declaration decoded from `OP_SET_TEXT_ROW`: binds the text node to the
+/// same-keyed probe div (`key`, exactly the key passed to `OP_SET_KEY` on the
+/// parent row segment) so the two pull exports can resolve it in
+/// `TEXT_METRICS`, and optionally carries a caret.
+#[derive(Clone, PartialEq, Debug)]
+struct TextRowSpec {
+    key: String,
+    caret: Option<CaretSpec>,
+}
+
 #[derive(Clone)]
 enum UiNode {
     Div {
@@ -753,6 +775,10 @@ enum UiNode {
         /// the common single-style case, which renders through the plain
         /// `div().child(content)` path unchanged.
         runs: Vec<TextRunSpec>,
+        /// Row declaration (`OP_SET_TEXT_ROW`): metrics key + optional
+        /// Rust-painted caret. `None` for every node built without it, which
+        /// keeps the pre-existing render paths byte-for-byte identical.
+        row: Option<TextRowSpec>,
     },
     /// Editable text input (RFC 0003, issue #88). A leaf: the committed tree
     /// carries only the widget's identity and placeholder — the editable
@@ -863,6 +889,13 @@ fn push_node(nodes: &mut Vec<Option<UiNode>>, node: UiNode) -> i32 {
 //   OP_SET_TAB_INDEX  u8 | index i32                        (tab order; also marks focusable + tab stop)
 //   OP_SET_TAB_STOP   u8 | mode i32                         (0 = skip in Tab nav, nonzero = tab stop)
 //   OP_SET_SCROLL_ID  u8 | scroll_id i32                    (scroll feedback subscription, issue #89)
+//   OP_SET_TEXT_ROW   u8 | key_len u32 | utf8[key_len] | has_caret u8 | byte_offset u32 | r u8 | g u8 | b u8 | blink u8
+//                     (declares a text node as a metrics/caret row: `key` binds
+//                     it to the same-keyed probe div for the text metrics pull
+//                     ABI; `has_caret != 0` paints a caret quad at
+//                     `byte_offset` (a UTF-8 byte offset into the node's
+//                     content, validated at decode) and `blink != 0` runs the
+//                     velotype-style blink; both flags are strictly 0/1)
 //   OP_ADD_CHILD      u8            (pops child, then parent; re-pushes parent)
 //   OP_SET_ROOT       u8            (pops the root)
 //
@@ -1098,6 +1131,7 @@ fn build_tree_from_buffer(view: usize, data: &[u8]) -> i32 {
                         color: (r, g, b),
                         size,
                         runs: Vec::new(),
+                        row: None,
                     },
                 );
                 if id < 0 {
@@ -1693,6 +1727,59 @@ fn build_tree_from_buffer(view: usize, data: &[u8]) -> i32 {
                     _ => unreachable!("with_top_div guarantees a div"),
                 })
             }
+            OP_SET_TEXT_ROW => {
+                let Some(key) = reader.read_string() else {
+                    return GPUI_STATUS_TRUNCATED_BUFFER;
+                };
+                let Some(has_caret) = reader.read_u8() else {
+                    return GPUI_STATUS_TRUNCATED_BUFFER;
+                };
+                let Some(byte_offset) = reader.read_u32() else {
+                    return GPUI_STATUS_TRUNCATED_BUFFER;
+                };
+                let (Some(r), Some(g), Some(b)) =
+                    (reader.read_u8(), reader.read_u8(), reader.read_u8())
+                else {
+                    return GPUI_STATUS_TRUNCATED_BUFFER;
+                };
+                let Some(blink) = reader.read_u8() else {
+                    return GPUI_STATUS_TRUNCATED_BUFFER;
+                };
+                // Flags are strictly 0/1 (like unknown run flags, an old
+                // binary must not half-apply a meaning it does not know).
+                if has_caret > 1 || blink > 1 {
+                    return GPUI_STATUS_INVALID_TEXT_RUN;
+                }
+                let Some(&handle) = stack.last() else {
+                    return GPUI_STATUS_INVALID_HANDLE;
+                };
+                let node = match nodes.get_mut(handle as usize) {
+                    None => return GPUI_STATUS_INVALID_HANDLE,
+                    Some(None) => return GPUI_STATUS_NODE_ABSENT,
+                    Some(Some(node)) => node,
+                };
+                let UiNode::Text { content, row, .. } = node else {
+                    return GPUI_STATUS_WRONG_NODE_KIND;
+                };
+                // The caret offset is validated against the owning node,
+                // exactly like a run range: `position_for_index` must never
+                // see an out-of-bounds or mid-char byte offset.
+                if has_caret == 1
+                    && (byte_offset as usize > content.len()
+                        || !content.is_char_boundary(byte_offset as usize))
+                {
+                    return GPUI_STATUS_INVALID_TEXT_RUN;
+                }
+                *row = Some(TextRowSpec {
+                    key,
+                    caret: (has_caret == 1).then(|| CaretSpec {
+                        byte_offset: byte_offset as usize,
+                        color: (r, g, b),
+                        blink: blink == 1,
+                    }),
+                });
+                GPUI_STATUS_OK
+            }
             OP_ADD_CHILD => {
                 let (Some(child), Some(parent)) = (stack.pop(), stack.pop()) else {
                     return GPUI_STATUS_INVALID_HANDLE;
@@ -1756,6 +1843,7 @@ fn build_tree_from_buffer(view: usize, data: &[u8]) -> i32 {
         return GPUI_STATUS_NODE_ABSENT;
     }
     let live_scroll_ids;
+    let mut has_blinking_caret = false;
     {
         // One iterative pass validates both invariants that span the whole
         // tree: unique keys, and a bounded nesting depth. Depth is carried on
@@ -1780,6 +1868,25 @@ fn build_tree_from_buffer(view: usize, data: &[u8]) -> i32 {
                 ..
             } = node
             else {
+                // A committed tree carrying a blinking caret resets the blink
+                // epoch: every keystroke/move/click rebuild puts the caret
+                // back in its full-opacity phase, matching velotype's
+                // input-resets-blink behavior.
+                if let UiNode::Text {
+                    row:
+                        Some(TextRowSpec {
+                            caret:
+                                Some(CaretSpec {
+                                    blink: true,
+                                    ..
+                                }),
+                            ..
+                        }),
+                    ..
+                } = node
+                {
+                    has_blinking_caret = true;
+                }
                 continue;
             };
             if let Some(key) = key {
@@ -1801,6 +1908,9 @@ fn build_tree_from_buffer(view: usize, data: &[u8]) -> i32 {
     }
     views[view] = Some(root_node);
     drop(views);
+    if has_blinking_caret {
+        BLINK_EPOCH_MS.store(blink_now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
     scroll_mirror_prune(view as i32, &live_scroll_ids);
     GPUI_STATUS_OK
 }
@@ -2095,6 +2205,41 @@ fn schedule_benchmark_frame(window: &mut Window, view: i32, entity: &WeakEntity<
     let entity = entity.clone();
     window.on_next_frame(move |window, cx| {
         benchmark_frame_tick(window, cx, view, &entity);
+    });
+}
+
+/// True when the committed tree declares a blinking caret (`OP_SET_TEXT_ROW`
+/// with `blink`). This is the blink chain's sole arm condition — no caret on
+/// screen means no extra frames.
+fn tree_has_blinking_caret(node: &UiNode) -> bool {
+    stacker::maybe_grow(STACK_RED_ZONE, STACK_GROW_BY, || match node {
+        UiNode::Text {
+            row:
+                Some(TextRowSpec {
+                    caret: Some(CaretSpec { blink: true, .. }),
+                    ..
+                }),
+            ..
+        } => true,
+        UiNode::Div { children, .. } => children.iter().any(tree_has_blinking_caret),
+        _ => false,
+    })
+}
+
+/// Keep the caret blinking for one more frame. `on_next_frame` callbacks only
+/// run when GPUI schedules another draw (the comment on the benchmark's
+/// re-arm is about exactly this), so `window.refresh()` pins the next frame;
+/// the callback re-notifies the view so its render re-runs and re-evaluates
+/// `caret_opacity`. Render re-arms the chain only while a blinking caret is
+/// on screen, so the chain stops by itself when the caret leaves or the tree
+/// stops declaring one.
+fn schedule_blink_frame(window: &mut Window, entity: &WeakEntity<FfiView>) {
+    let entity = entity.clone();
+    window.on_next_frame(move |window, cx| {
+        if let Some(view) = entity.upgrade() {
+            view.update(cx, |_, cx| cx.notify());
+        }
+        window.refresh();
     });
 }
 
@@ -3346,6 +3491,9 @@ impl Element for ProbeBoundsProbe {
             if self.key == "probe:clear" {
                 // First probe of the frame (root's first child): fresh table.
                 table.clear();
+                // The text-row layout mirror starts the frame empty too (both
+                // mirrors cover the same painted subtree).
+                TEXT_METRICS.with(|metrics| *metrics.borrow_mut() = None);
             }
             table.insert(self.key.clone(), rect);
         }
@@ -3394,6 +3542,302 @@ pub extern "C" fn gpui_probe_rect(buf: *const u8, len: i32, out: *mut u8) -> i32
             }
             None => -1,
         }
+    })
+}
+
+// --- Text-row metrics + painted caret (OP_SET_TEXT_ROW) -------------------
+//
+// Companion to `ProbeBoundsProbe` for text nodes. The probe div publishes its
+// own rect, but a text node's *layout* lives inside gpui's `TextLayout`, and
+// only that can turn a click into the exact character it landed on — or a
+// caret offset into the exact pixel rect. Both directions ride the same
+// mirror-then-pull model as `gpui_probe_rect`: `TextRowProbe` mirrors the
+// layout into `TEXT_METRICS` and the caret rect into `PROBE_BOUNDS["caret"]`
+// during prepaint; the exports pull the LAST painted frame's values (MoonBit
+// FFI runs synchronously on the UI thread between frames).
+
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// Blink phase origin in Unix milliseconds. Every `gpui_build_tree` commit
+/// that carries a blinking caret resets this, so the caret is always at full
+/// opacity for 0.5 s after a keystroke/move/click rebuild (velotype's
+/// `cursor_blink_epoch` semantics).
+static BLINK_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+
+fn blink_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Caret opacity for the current instant — velotype's exact curve
+/// (`cursor_opacity`): full for the first 0.5 s, then a 1 s-period cosine.
+fn caret_opacity(now_ms: u64) -> f32 {
+    let t = now_ms.saturating_sub(BLINK_EPOCH_MS.load(AtomicOrdering::Relaxed)) as f32 / 1000.0;
+    if t < 0.5 {
+        1.0
+    } else {
+        let t = t - 0.5;
+        (t * std::f32::consts::TAU).cos().mul_add(0.5, 0.5)
+    }
+}
+
+thread_local! {
+    /// Mirror of the last painted frame's keyed text-row layouts, keyed by
+    /// the `OP_SET_TEXT_ROW` key (the same string the row-segment probe div
+    /// publishes under). Values are the shared `TextLayout` handle plus the
+    /// node's content — gpui's layout indices are UTF-8 byte offsets while
+    /// MoonBit's model counts characters, so both exports translate through
+    /// the stored content (rows are short; a linear scan beats bookkeeping).
+    /// `TextLayout` is not `Send`, hence a thread-local like the test-only
+    /// `TEXT_LAYOUTS` stash; queries arrive on the UI thread during dispatch.
+    /// Rebuilt every frame: cleared by the root's `"probe:clear"` div.
+    static TEXT_METRICS: RefCell<Option<HashMap<String, (TextLayout, String)>>> =
+        const { RefCell::new(None) };
+}
+
+/// Transparent wrapper (same shape as `ProbeBoundsProbe`): delegates layout
+/// and painting to the child and, during prepaint — after the child has laid
+/// out and positioned itself — mirrors the shared `TextLayout` and writes the
+/// caret quad's rect into `PROBE_BOUNDS["caret"]` (the IME candidate anchor's
+/// existing key, so `ImeBridge::bounds_for_range` keeps working unchanged).
+/// Paints the caret itself, velotype-style: a `paint_quad` bar at the
+/// layout-derived position, alpha-shaped by the blink curve.
+struct TextRowProbe {
+    child: AnyElement,
+    key: String,
+    content: String,
+    layout: TextLayout,
+    caret: Option<CaretSpec>,
+}
+
+impl IntoElement for TextRowProbe {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TextRowProbe {
+    type RequestLayoutState = ();
+    /// Caret rect (window-space px) + color + blink flag; `None` without a
+    /// caret declaration (or if the layout could not place the offset).
+    type PrepaintState = Option<([f32; 4], (u8, u8, u8), bool)>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        // Transparent: the child's own layout node is ours.
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        // The child first: only once its `TextLayout` inner is measured and
+        // bounds-set do the position/index queries resolve (they panic
+        // before that) and answer in window-space coords.
+        self.child.prepaint(window, cx);
+        TEXT_METRICS.with(|metrics| {
+            let mut table = metrics.borrow_mut();
+            let table = table.get_or_insert_with(HashMap::new);
+            table.insert(
+                self.key.clone(),
+                (self.layout.clone(), self.content.clone()),
+            );
+        });
+        self.caret.as_ref().and_then(|spec| {
+            // Validated at decode time to be an in-bounds char boundary.
+            self.layout
+                .position_for_index(spec.byte_offset)
+                .map(|origin| {
+                    let rect = [
+                        f32::from(origin.x),
+                        f32::from(origin.y),
+                        2.0,
+                        f32::from(self.layout.line_height()),
+                    ];
+                    let mut bounds = PROBE_BOUNDS.lock().unwrap_or_else(|e| e.into_inner());
+                    bounds
+                        .get_or_insert_with(HashMap::new)
+                        .insert("caret".to_string(), rect);
+                    drop(bounds);
+                    (rect, spec.color, spec.blink)
+                })
+        })
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.paint(window, cx);
+        if let Some(([x, y, w, h], (r, g, b), blink)) = *prepaint {
+            // The 2 px bar rides the real layout position; the frame chain
+            // that keeps re-evaluating the blink lives in
+            // `schedule_blink_frame` (armed from `FfiView::render`).
+            let opacity = if blink {
+                caret_opacity(blink_now_ms())
+            } else {
+                1.0
+            };
+            let alpha = (opacity * 255.0).round() as u32;
+            if alpha > 0 {
+                let color = (u32::from(r) << 24) | (u32::from(g) << 16) | (u32::from(b) << 8) | alpha;
+                window.paint_quad(fill(
+                    Bounds::new(point(px(x), px(y)), size(px(w), px(h))),
+                    rgba(color),
+                ));
+            }
+        }
+    }
+}
+
+/// Parse the ASCII key operand shared by both text-metric pulls.
+fn utf8_metric_key<'a>(buf: *const u8, len: i32) -> Option<&'a str> {
+    if buf.is_null() || len <= 0 {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buf, len as usize) };
+    std::str::from_utf8(bytes).ok()
+}
+
+/// Look up a row mirrored during the last painted frame.
+fn with_text_row<T>(key: &str, f: impl FnOnce(&TextLayout, &str) -> T) -> Option<T> {
+    TEXT_METRICS.with(|metrics| {
+        let table = metrics.borrow();
+        let (layout, content) = table.as_ref()?.get(key)?;
+        Some(f(layout, content))
+    })
+}
+
+/// Character index (or the char count, meaning the row-end insertion point)
+/// → UTF-8 byte offset into `content`.
+fn char_index_to_byte(content: &str, char_index: usize) -> Option<usize> {
+    let mut seen = 0;
+    for (byte, _) in content.char_indices() {
+        if seen == char_index {
+            return Some(byte);
+        }
+        seen += 1;
+    }
+    (seen == char_index).then(|| content.len())
+}
+
+/// Byte offset (validated to be a boundary, or clamped to `content.len()`)
+/// → character index.
+fn byte_to_char_index(content: &str, byte: usize) -> Option<usize> {
+    if byte > content.len() {
+        return None;
+    }
+    Some(content[..byte].chars().count())
+}
+
+/// Write a `Pixels` value as 1/4-pixel fixed-point little-endian i32.
+fn write_fixed_px(value: Pixels, out: *mut u8) {
+    let q = (f32::from(value) * 4.0).round() as i32;
+    unsafe { std::ptr::copy_nonoverlapping(q.to_le_bytes().as_ptr(), out, 4) };
+}
+
+/// Pull ABI: the window-space position of a character within a keyed text row
+/// as painted in the LAST frame. `buf`/`len` carry the ASCII key bytes (the
+/// same string as the row's `OP_SET_TEXT_ROW`); `char_index` counts Unicode
+/// characters (MoonBit's model), where the row's char count means the row-end
+/// insertion point. On a hit writes `(x, y)` as two 1/4-pixel fixed-point LE
+/// i32s into `out` (8 bytes, caller pre-zeroed) and returns 0; -1 on a miss
+/// (never painted this frame-chain, char past the end).
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_text_x_for_char(
+    buf: *const u8,
+    len: i32,
+    char_index: i32,
+    out: *mut u8,
+) -> i32 {
+    ffi_export("gpui_text_x_for_char", || {
+        if out.is_null() || char_index < 0 {
+            return -1;
+        }
+        let key = match utf8_metric_key(buf, len) {
+            Some(key) => key,
+            None => return -1,
+        };
+        with_text_row(key, |layout, content| {
+            let byte = char_index_to_byte(content, char_index as usize)?;
+            let pos = layout.position_for_index(byte)?;
+            unsafe {
+                write_fixed_px(pos.x, out);
+                write_fixed_px(pos.y, out.add(4));
+            }
+            Some(0)
+        })
+        .flatten()
+        .unwrap_or(-1)
+    })
+}
+
+/// Pull ABI: the inverse of `gpui_text_x_for_char` — the character index
+/// nearest a window-space point in a keyed text row from the LAST painted
+/// frame. `x`/`y` are 1/4-pixel fixed-point i32 (integer pixels × 4). gpui's
+/// nearest-line semantics apply: a point past the end of a row's text yields
+/// that line's end offset, which is what click placement wants. On a hit
+/// writes the LE i32 char index into `out` (4 bytes, pre-zeroed) and returns
+/// 0; -1 on a miss.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_text_char_for_position(
+    buf: *const u8,
+    len: i32,
+    x: i32,
+    y: i32,
+    out: *mut u8,
+) -> i32 {
+    ffi_export("gpui_text_char_for_position", || {
+        if out.is_null() {
+            return -1;
+        }
+        let key = match utf8_metric_key(buf, len) {
+            Some(key) => key,
+            None => return -1,
+        };
+        let index = match with_text_row(key, |layout, content| {
+            let position = point(px(x as f32 / 4.0), px(y as f32 / 4.0));
+            // `index_for_position` answers with the nearest byte offset in
+            // both Ok and Err variants (Err marks the between-lines case);
+            // either is the right click target.
+            let byte = layout.index_for_position(position).unwrap_or_else(|i| i);
+            byte_to_char_index(content, byte.min(content.len()))
+        })
+        .flatten()
+        {
+            Some(index) => index,
+            None => return -1,
+        };
+        unsafe { std::ptr::copy_nonoverlapping(index.to_le_bytes().as_ptr(), out, 4) };
+        0
     })
 }
 
@@ -3727,7 +4171,7 @@ impl Element for ImeBridgeProbe {
 }
 
 impl Render for FfiView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Render the committed root for this view (swapped in by `commit_tree`).
         // Cloned out so the lock is not held while building GPUI elements.
         let root = {
@@ -3859,6 +4303,18 @@ impl Render for FfiView {
             ) {
                 d = d.child(el);
             }
+        }
+        // Caret blink repaint loop: while the committed tree declares a
+        // blinking caret, keep the frame chain alive. Benchmark windows own
+        // their frame loop through the benchmark tick — arming here as well
+        // would double-frame and pollute `frame_work` — so the blink chain
+        // defers to the benchmark entirely.
+        if !benchmark_window_active()
+            && root
+                .as_ref()
+                .is_some_and(|root| tree_has_blinking_caret(root))
+        {
+            schedule_blink_frame(window, &cx.weak_entity());
         }
         let element = ImeBridgeProbe {
             child: d.into_any_element(),
@@ -4615,6 +5071,7 @@ fn render_node_inner(
             color: (r, g, b),
             size,
             runs,
+            row,
         } => {
             // The content string flows through unmodified (issue #16). The
             // first-glyph subpixel fix lives in `TextGlyphInset`, a
@@ -4626,7 +5083,13 @@ fn render_node_inner(
                 // G24 headless harness: expose this text element's laid-out
                 // bounds under `text:<content>` (no-op without `test-support`).
                 .debug_selector(|| format!("text:{content}"));
-            if runs.is_empty() {
+            // Shared layout handle for the metrics mirror; only `StyledText`
+            // exposes one, so a row-declared node takes the rich-text path
+            // even without runs (`with_highlights([])` builds the exact
+            // element `div().child(content)` used to build, same inherited
+            // base style, just with a reachable `TextLayout`).
+            let mut layout: Option<TextLayout> = None;
+            if runs.is_empty() && row.is_none() {
                 // Single-style text: the pre-#91 path, unchanged.
                 text = text.child(content.clone());
             } else {
@@ -4641,14 +5104,30 @@ fn render_node_inner(
                     .with_highlights(runs.iter().map(|run| {
                         (run.start..run.start + run.len, highlight_for_run(run))
                     }));
+                layout = Some(styled.layout().clone());
                 #[cfg(any(test, feature = "test-support"))]
                 text_layout_stash(content, styled.layout().clone());
                 text = text.child(styled);
             }
-            let inset = TextGlyphInset {
+            let mut el = TextGlyphInset {
                 child: text.into_any_element(),
-            };
-            Some(inset.into_any_element())
+            }
+            .into_any_element();
+            // Row declaration (`OP_SET_TEXT_ROW`): mirror the layout for the
+            // metrics pulls and paint the caret from it. Outside the inset —
+            // paint-order irrelevant, and its prepaint sees plain
+            // pre-inset coords like every other probe.
+            if let (Some(row), Some(layout)) = (row, layout) {
+                el = TextRowProbe {
+                    child: el,
+                    key: row.key.clone(),
+                    content: content.clone(),
+                    layout,
+                    caret: row.caret.clone(),
+                }
+                .into_any_element();
+            }
+            Some(el)
         }
         UiNode::TextInput {
             input_id,
@@ -5994,6 +6473,7 @@ mod tests {
             ("OP_SET_TAB_STOP", OP_SET_TAB_STOP),
             ("OP_TEXT_INPUT", OP_TEXT_INPUT),
             ("OP_TEXT_RUN", OP_TEXT_RUN),
+            ("OP_SET_TEXT_ROW", OP_SET_TEXT_ROW),
             ("RUN_STYLE_COLOR", RUN_STYLE_COLOR),
             ("RUN_STYLE_WEIGHT", RUN_STYLE_WEIGHT),
             ("RUN_STYLE_ITALIC", RUN_STYLE_ITALIC),
@@ -7388,6 +7868,132 @@ mod tests {
         with_test(|| {
             let mut b = Buf::new();
             b.text("ab", 0, 0, 0, 12.0).op(OP_TEXT_RUN).u32(0); // record cut short
+            assert_eq!(b.build(0), GPUI_STATUS_TRUNCATED_BUFFER);
+        });
+    }
+
+    // --- OP_SET_TEXT_ROW decode + validation (text-row ABI) -------------------
+
+    impl Buf {
+        /// One `OP_SET_TEXT_ROW` record.
+        fn text_row(
+            &mut self,
+            key: &str,
+            has_caret: u8,
+            byte_offset: u32,
+            color: (u8, u8, u8),
+            blink: u8,
+        ) -> &mut Self {
+            self.op(OP_SET_TEXT_ROW)
+                .str(key)
+                .u8(has_caret)
+                .u32(byte_offset)
+                .u8(color.0)
+                .u8(color.1)
+                .u8(color.2)
+                .u8(blink)
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn set_text_row_decodes_onto_text_node() {
+        with_test(|| {
+            let mut b = Buf::new();
+            // Offset 4 == start of "b" in "aあbc": a valid boundary.
+            b.text("aあbc", 0, 0, 0, 12.0)
+                .text_row("r1", 1, 4, (1, 2, 3), 1)
+                .set_root();
+            assert_eq!(b.build(0), GPUI_STATUS_OK);
+            with_views(|views| {
+                let Some(UiNode::Text { row, .. }) = &views[0] else {
+                    panic!("text root expected");
+                };
+                assert_eq!(
+                    row,
+                    &Some(TextRowSpec {
+                        key: "r1".to_string(),
+                        caret: Some(CaretSpec {
+                            byte_offset: 4,
+                            color: (1, 2, 3),
+                            blink: true,
+                        }),
+                    })
+                );
+            });
+        });
+    }
+
+    #[::core::prelude::v1::test]
+    fn set_text_row_without_caret_accepts_ignored_operands() {
+        with_test(|| {
+            let mut b = Buf::new();
+            // has_caret = 0: the offset slot is inert, garbage and all.
+            b.text("ab", 0, 0, 0, 12.0)
+                .text_row("k", 0, 9999, (0, 0, 0), 0)
+                .set_root();
+            assert_eq!(b.build(0), GPUI_STATUS_OK);
+            with_views(|views| {
+                let Some(UiNode::Text { row, .. }) = &views[0] else {
+                    panic!("text root expected");
+                };
+                assert_eq!(row.as_ref().unwrap().caret, None);
+            });
+        });
+    }
+
+    #[::core::prelude::v1::test]
+    fn set_text_row_on_div_is_wrong_node_kind() {
+        with_test(|| {
+            let mut b = Buf::new();
+            b.div().text_row("k", 1, 0, (0, 0, 0), 0);
+            assert_eq!(b.build(0), GPUI_STATUS_WRONG_NODE_KIND);
+        });
+    }
+
+    #[::core::prelude::v1::test]
+    fn set_text_row_rejects_non_char_boundary_offset() {
+        with_test(|| {
+            // byte 1 is inside "あ"'s 3-byte encoding; the row-end offset
+            // (== content length) is legal as the insertion point.
+            let mut mid = Buf::new();
+            mid.text("aあbc", 0, 0, 0, 12.0)
+                .text_row("k", 1, 2, (0, 0, 0), 0);
+            assert_eq!(mid.build(0), GPUI_STATUS_INVALID_TEXT_RUN);
+            let mut past = Buf::new();
+            past.text("ab", 0, 0, 0, 12.0)
+                .text_row("k", 1, 3, (0, 0, 0), 0);
+            assert_eq!(past.build(0), GPUI_STATUS_INVALID_TEXT_RUN);
+            let mut end = Buf::new();
+            end.text("ab", 0, 0, 0, 12.0)
+                .text_row("k", 1, 2, (0, 0, 0), 0)
+                .set_root();
+            assert_eq!(end.build(0), GPUI_STATUS_OK);
+        });
+    }
+
+    #[::core::prelude::v1::test]
+    fn set_text_row_rejects_unknown_flag_values() {
+        with_test(|| {
+            // Like unknown run flags: strictly 0/1, never half-apply.
+            let mut caret_two = Buf::new();
+            caret_two.text("ab", 0, 0, 0, 12.0).text_row("k", 2, 0, (0, 0, 0), 0);
+            assert_eq!(caret_two.build(0), GPUI_STATUS_INVALID_TEXT_RUN);
+            let mut blink_two = Buf::new();
+            blink_two.text("ab", 0, 0, 0, 12.0).text_row("k", 1, 0, (0, 0, 0), 2);
+            assert_eq!(blink_two.build(0), GPUI_STATUS_INVALID_TEXT_RUN);
+        });
+    }
+
+    #[::core::prelude::v1::test]
+    fn set_text_row_truncated_operands_are_rejected() {
+        with_test(|| {
+            let mut b = Buf::new();
+            b.text("ab", 0, 0, 0, 12.0)
+                .op(OP_SET_TEXT_ROW)
+                .str("k")
+                .u8(1)
+                .u32(0)
+                .u8(0); // color + blink slots cut short
             assert_eq!(b.build(0), GPUI_STATUS_TRUNCATED_BUFFER);
         });
     }

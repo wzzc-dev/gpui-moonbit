@@ -73,6 +73,7 @@ OP_SET_TAB_STOP = 37
 OP_TEXT_INPUT = 38
 OP_TEXT_RUN = 39
 OP_SET_SCROLL_ID = 40
+OP_SET_TEXT_ROW = 41
 
 # G7 style enum values. These are operand values (not opcodes); they share the
 # same constant-generation + cross-boundary drift guard as the opcodes above so

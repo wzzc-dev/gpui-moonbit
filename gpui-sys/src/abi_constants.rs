@@ -67,6 +67,7 @@ pub(crate) const OP_SET_TAB_STOP: i32 = 37;
 pub(crate) const OP_TEXT_INPUT: i32 = 38;
 pub(crate) const OP_TEXT_RUN: i32 = 39;
 pub(crate) const OP_SET_SCROLL_ID: i32 = 40;
+pub(crate) const OP_SET_TEXT_ROW: i32 = 41;
 pub(crate) const ALIGN_DEFAULT: i32 = 0;
 pub(crate) const ALIGN_START: i32 = 1;
 pub(crate) const ALIGN_CENTER: i32 = 2;
