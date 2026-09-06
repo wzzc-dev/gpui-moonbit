@@ -295,7 +295,7 @@ int32_t gpui_probe_rect(const uint8_t *buf, int32_t len, uint8_t *out);
 int32_t gpui_text_x_for_char(const uint8_t *buf, int32_t len, int32_t char_index, uint8_t *out);
 
 /**
- * Pull ABI: the inverse of `gpui_text_x_for_char` — the character index
+ * Pull ABI: the inverse of `gpui_text_x_for_char` — the character boundary
  * nearest a window-space point in a keyed text row from the LAST painted
  * frame. `x`/`y` are 1/4-pixel fixed-point i32 (integer pixels × 4). gpui's
  * nearest-line semantics apply: a point past the end of a row's text yields

@@ -3024,7 +3024,13 @@ impl EntityInputHandler for TextInputModel {
     ) -> Option<usize> {
         let bounds = self.last_bounds.as_ref()?;
         let layout = self.last_layout.as_ref()?;
-        let utf8_index = layout.index_for_x(point.x - bounds.left())?;
+        // Nearest-boundary semantics (gpui's `closest_index_for_x`): the IME
+        // maps a point to an insertion index, so the closest boundary — not
+        // the character whose cell contains the point — is the right answer.
+        // Clamped against the mirror's content in case the layout is stale.
+        let utf8_index = layout
+            .closest_index_for_x(point.x - bounds.left())
+            .min(self.content.len());
         Some(offset_to_utf16(&self.content, utf8_index))
     }
 }
@@ -3758,6 +3764,37 @@ fn byte_to_char_index(content: &str, byte: usize) -> Option<usize> {
     Some(content[..byte].chars().count())
 }
 
+/// Snap an in-line click hit to the nearest character boundary — gpui's
+/// `closest_index_for_x` semantics, tie broken toward the earlier boundary.
+/// `index_for_position`'s `Ok` answers with the character whose cell contains
+/// x, so a click in a glyph's right half still lands before that glyph — up
+/// to a full character behind the click. Refine by comparing the click x
+/// against the bracketing boundaries via `position_for_index` (the same
+/// positions the caret quad paints at, so hit placement and caret rendering
+/// stay pinned to one layout). Unresolvable positions pass through unchanged.
+fn snap_to_nearest_boundary(layout: &TextLayout, content: &str, byte: usize, x: Pixels) -> usize {
+    let byte = byte.min(content.len());
+    if !content.is_char_boundary(byte) {
+        return byte;
+    }
+    let Some(ch) = content[byte..].chars().next() else {
+        return byte; // at/past the row end: no following boundary to snap to
+    };
+    let (Some(prev_x), Some(next_x)) = (
+        layout.position_for_index(byte).map(|p| p.x),
+        layout.position_for_index(byte + ch.len_utf8()).map(|p| p.x),
+    ) else {
+        return byte;
+    };
+    // Strictly closer only — an exact midpoint keeps the character, matching
+    // `LineLayout::closest_index_for_x`'s tie-break.
+    if next_x - x < x - prev_x {
+        byte + ch.len_utf8()
+    } else {
+        byte
+    }
+}
+
 /// Write a `Pixels` value as 1/4-pixel fixed-point little-endian i32.
 fn write_fixed_px(value: Pixels, out: *mut u8) {
     let q = (f32::from(value) * 4.0).round() as i32;
@@ -3800,7 +3837,7 @@ pub extern "C" fn gpui_text_x_for_char(
     })
 }
 
-/// Pull ABI: the inverse of `gpui_text_x_for_char` — the character index
+/// Pull ABI: the inverse of `gpui_text_x_for_char` — the character boundary
 /// nearest a window-space point in a keyed text row from the LAST painted
 /// frame. `x`/`y` are 1/4-pixel fixed-point i32 (integer pixels × 4). gpui's
 /// nearest-line semantics apply: a point past the end of a row's text yields
@@ -3825,10 +3862,18 @@ pub extern "C" fn gpui_text_char_for_position(
         };
         let index = match with_text_row(key, |layout, content| {
             let position = point(px(x as f32 / 4.0), px(y as f32 / 4.0));
-            // `index_for_position` answers with the nearest byte offset in
-            // both Ok and Err variants (Err marks the between-lines case);
-            // either is the right click target.
-            let byte = layout.index_for_position(position).unwrap_or_else(|i| i);
+            // In-line hits (`Ok`) answer with the byte offset of the character
+            // whose cell contains x; snap to the nearest boundary so a click
+            // in a glyph's right half places the caret after it —
+            // `index_for_x` alone would leave the caret up to a full
+            // character behind the click. `Err` marks the between-lines /
+            // past-the-edge cases and already carries the row start or end;
+            // the horizontal snap is meaningless there (a click far above the
+            // row must land at its start regardless of x), so pass it through.
+            let byte = match layout.index_for_position(position) {
+                Ok(byte) => snap_to_nearest_boundary(layout, content, byte, position.x),
+                Err(byte) => byte,
+            };
             byte_to_char_index(content, byte.min(content.len()))
         })
         .flatten()

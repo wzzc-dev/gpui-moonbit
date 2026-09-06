@@ -736,11 +736,28 @@ fn text_row_metrics_and_caret_roundtrip(cx: &mut TestAppContext) {
         );
         (status == 0).then(|| i32::from_le_bytes(out))
     };
-    // Mid-glyph clicks land on the exact character (the whole point:
-    // proportional fonts must not fall back to linear interpolation).
+    // Mid-glyph clicks sit at the exact boundary midpoint, where the tie
+    // keeps the character under the click (matches gpui's
+    // `closest_index_for_x` tie-break; proportional fonts must not fall back
+    // to linear interpolation).
     assert_eq!(char_at(x0 + 6.0, y0), Some(0));
     assert_eq!(char_at(x1 + 6.0, y0), Some(1));
     assert_eq!(char_at(x2 + 6.0, y2), Some(2));
+    // Nearest-boundary snapping: a click in a glyph's left half keeps the
+    // caret before it, the right half places it after — half a cell past the
+    // midpoint flips to the following boundary. Covers the multibyte char
+    // (its refinement spans the 3-byte 'あ') and the row end.
+    assert_eq!(char_at(x0 + 5.0, y0), Some(0), "left half keeps the caret");
+    assert_eq!(char_at(x0 + 7.0, y0), Some(1), "right half snaps past the glyph");
+    assert_eq!(
+        char_at(x1 + 7.0, y0),
+        Some(2),
+        "right half of the 3-byte char snaps past it"
+    );
+    assert_eq!(char_at(x2 + 5.0, y2), Some(2));
+    assert_eq!(char_at(x2 + 7.0, y2), Some(3));
+    assert_eq!(char_at(x3 + 5.0, y0), Some(3));
+    assert_eq!(char_at(x3 + 7.0, y0), Some(4), "right half of the last char ends the row");
     // gpui's nearest-line semantics: far right clamps to the row end, far
     // left / above land at 0.
     assert_eq!(char_at(x4 + 200.0, y0), Some(4));
