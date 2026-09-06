@@ -2012,12 +2012,17 @@ pub extern "C" fn gpui_run_window(view: i32, width: f32, height: f32) -> i32 {
 }
 
 fn run_window(view: usize, width: f32, height: f32, benchmark: bool) {
-    Application::new().run(move |cx: &mut App| {
+    open_trace_mark("run_enter");
+    let app = Application::new();
+    open_trace_mark("application_new");
+    app.run(move |cx: &mut App| {
+        open_trace_mark("nsapp_ready");
         // Attach a fresh wake channel and start the drain pump before the
         // window opens, so events posted from other threads — including any
         // backlog queued before startup — are drained as soon as the loop
         // runs (RFC 0002 §3.3).
         spawn_drain_pump(cx, install_inject_queue());
+        open_trace_mark("drain_pump");
         let view_id = view as i32;
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
         let window = cx
@@ -2044,6 +2049,7 @@ fn run_window(view: usize, width: f32, height: f32, benchmark: bool) {
                 },
             )
             .unwrap();
+        open_trace_mark("open_window");
         // Route drain-pump notifications to this view (RFC 0002 §3.4). The
         // root entity is only reachable through `read_window` (the `root`
         // accessor is test-support-gated), so downgrade inside the closure and
@@ -2068,6 +2074,7 @@ fn run_window(view: usize, width: f32, height: f32, benchmark: bool) {
             });
         }
         cx.activate(true);
+        open_trace_mark("startup_tail");
     });
 }
 
@@ -2152,6 +2159,20 @@ unsafe extern "C" {
 
 fn benchmark_milliseconds(started: std::time::Instant, finished: std::time::Instant) -> f64 {
     finished.duration_since(started).as_secs_f64() * 1000.0
+}
+
+/// Diagnostic only: with `GPUI_OPEN_TRACE=1`, print the elapsed time since
+/// the benchmark window opened at each startup stage. Pure additive stderr
+/// output — the measured fields and the report protocol are untouched.
+fn open_trace_mark(label: &'static str) {
+    if std::env::var_os("GPUI_OPEN_TRACE").is_none() {
+        return;
+    }
+    let guard = WINDOW_BENCHMARK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(benchmark) = guard.as_ref() {
+        let elapsed = benchmark_milliseconds(benchmark.started, std::time::Instant::now());
+        eprintln!("gpui-open-trace {label}={elapsed:.3}ms");
+    }
 }
 
 fn benchmark_epoch_ms() -> f64 {
@@ -4434,6 +4455,7 @@ impl Element for BenchmarkFrameProbe {
     ) {
         self.child.paint(window, cx);
         let elapsed = benchmark_milliseconds(*state, std::time::Instant::now());
+        let mut first_frame = false;
         if let Some(benchmark) = WINDOW_BENCHMARK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4446,8 +4468,12 @@ impl Element for BenchmarkFrameProbe {
                 // anchored to the measured paint completion instead.
                 benchmark.first_interactive_ms =
                     benchmark_milliseconds(benchmark.started, std::time::Instant::now());
+                first_frame = true;
             }
             benchmark.paint_work_ms = Some(elapsed);
+        }
+        if first_frame {
+            open_trace_mark("first_paint");
         }
     }
 }
