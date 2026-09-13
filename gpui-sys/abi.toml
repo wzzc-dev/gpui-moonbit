@@ -74,6 +74,7 @@ OP_TEXT_INPUT = 38
 OP_TEXT_RUN = 39
 OP_SET_SCROLL_ID = 40
 OP_SET_TEXT_ROW = 41
+OP_IMAGE = 42
 
 # G7 style enum values. These are operand values (not opcodes); they share the
 # same constant-generation + cross-boundary drift guard as the opcodes above so
@@ -131,6 +132,16 @@ WHITESPACE_NORMAL = 1
 WHITESPACE_NOWRAP = 2
 WHITESPACE_PRE = 3
 WHITESPACE_PRE_WRAP = 4
+
+# OP_IMAGE object-fit enum (issue #103). Values map onto gpui's `ObjectFit`
+# variants in the same order, so the operand is a plain enum id.
+
+[image_fit]
+IMAGE_FIT_FILL = 0
+IMAGE_FIT_CONTAIN = 1
+IMAGE_FIT_COVER = 2
+IMAGE_FIT_SCALE_DOWN = 3
+IMAGE_FIT_NONE = 4
 
 # OP_TEXT_RUN style-presence bitflags (issue #91). Fields absent from the flags
 # byte keep the run on the base text style, so a run record always carries every

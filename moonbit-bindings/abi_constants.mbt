@@ -205,6 +205,9 @@ pub const OP_SET_SCROLL_ID : Int = 40
 pub const OP_SET_TEXT_ROW : Int = 41
 
 ///|
+pub const OP_IMAGE : Int = 42
+
+///|
 pub const ALIGN_DEFAULT : Int = 0
 
 ///|
@@ -317,6 +320,21 @@ pub const WHITESPACE_PRE : Int = 3
 
 ///|
 pub const WHITESPACE_PRE_WRAP : Int = 4
+
+///|
+pub const IMAGE_FIT_FILL : Int = 0
+
+///|
+pub const IMAGE_FIT_CONTAIN : Int = 1
+
+///|
+pub const IMAGE_FIT_COVER : Int = 2
+
+///|
+pub const IMAGE_FIT_SCALE_DOWN : Int = 3
+
+///|
+pub const IMAGE_FIT_NONE : Int = 4
 
 ///|
 pub const RUN_STYLE_COLOR : Int = 1

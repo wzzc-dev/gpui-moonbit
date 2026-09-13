@@ -6,8 +6,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Headless layout harness (G24): decode a command buffer through the real
 /// decoder, render it in a gpui `TestAppContext` window (no GPU, no display),
@@ -18,6 +19,7 @@ use std::sync::{Mutex, OnceLock};
 pub mod headless;
 
 mod abi_constants;
+mod http;
 use abi_constants::{
     ABI_VERSION, ALIGN_CENTER, ALIGN_DEFAULT, ALIGN_END, ALIGN_START, ALIGN_STRETCH,
     BUFFER_VERSION, CURSOR_ARROW, CURSOR_COL_RESIZE, CURSOR_CROSSHAIR, CURSOR_EW_RESIZE,
@@ -28,7 +30,8 @@ use abi_constants::{
     JUSTIFY_SPACE_AROUND, JUSTIFY_SPACE_BETWEEN, JUSTIFY_START, KEY_BACKSPACE, KEY_DELETE,
     KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESCAPE, KEY_HOME, KEY_LEFT, KEY_PAGEUP, KEY_PAGEDOWN,
     KEY_RIGHT, KEY_TAB, KEY_UP, MOD_ALT, MOD_CTRL, MOD_FUNCTION, MOD_PLATFORM, MOD_SHIFT,
-    OP_ADD_CHILD, OP_DIV, OP_SET_ALIGN, OP_SET_BG, OP_SET_BG_COLOR, OP_SET_BORDER,
+    IMAGE_FIT_CONTAIN, IMAGE_FIT_COVER, IMAGE_FIT_FILL, IMAGE_FIT_NONE, IMAGE_FIT_SCALE_DOWN,
+    OP_ADD_CHILD, OP_DIV, OP_IMAGE, OP_SET_ALIGN, OP_SET_BG, OP_SET_BG_COLOR, OP_SET_BORDER,
     OP_SET_CENTER, OP_SET_CURSOR, OP_SET_FLEX, OP_SET_FLEX_ITEM, OP_SET_FOCUSABLE,
     OP_SET_FONT_FAMILY, OP_SET_FONT_WEIGHT, OP_SET_GAP, OP_SET_INSET, OP_SET_KEY,
     OP_SET_LINE_HEIGHT, OP_SET_MARGIN, OP_SET_MAX_SIZE, OP_SET_MIN_SIZE, OP_SET_ON_CLICK,
@@ -119,6 +122,12 @@ pub const GPUI_STATUS_DEPTH_EXCEEDED: i32 = -15;
 /// and `with_runs` asserts the runs tile the text — so a lenient decoder would
 /// trade a diagnosable status for a paint-time abort (issue #91).
 pub const GPUI_STATUS_INVALID_TEXT_RUN: i32 = -16;
+/// An `OP_IMAGE` record carries an `IMAGE_FIT_*` id outside the enum (issue
+/// #103). gpui's own `ObjectFit` has no "unknown" arm, so a lenient decoder
+/// would silently substitute the fallback variant and the caller would never
+/// learn its operand was dropped; rejected per-buffer like every other
+/// malformed record.
+pub const GPUI_STATUS_INVALID_IMAGE_FIT: i32 = -17;
 
 
 // Rust -> MoonBit callback. MoonBit native does not emit a stable C export
@@ -590,6 +599,10 @@ fn collect_text_contents(node: &UiNode, out: &mut Vec<u8>) {
         // The editable content lives in the per-view TextInputModel, not the
         // committed tree; read it via gpui_input_copy_text instead.
         UiNode::TextInput { .. } => {}
+        // An image carries no text. Its `source` is a locator, not content, so
+        // it stays out of the text read-back (the a11y name would be the alt
+        // text, which the caller renders as its own text node when it has one).
+        UiNode::Image { .. } => {}
     })
 }
 
@@ -789,6 +802,25 @@ enum UiNode {
         input_id: i32,
         placeholder: String,
     },
+    /// Bitmap/vector image (issue #103). A leaf sized by the box bounds.
+    ///
+    /// `source` is resolved at paint time by gpui's own asset pipeline, so a
+    /// remote URL never blocks the command-buffer commit: `http(s)://` goes
+    /// through the window's `HttpClient`, every other value is read from the
+    /// filesystem by [`ImageSource::Resource`]. Decoding, caching and the
+    /// load/failure/retry states all live in `ImgResourceLoader`, which is why
+    /// this node carries nothing but the bounds and the source string.
+    Image {
+        /// Upper bound on the laid-out width in px; `<= 0` = unconstrained.
+        width: f32,
+        /// Upper bound on the laid-out height in px; `<= 0` = unconstrained.
+        height: f32,
+        /// `IMAGE_FIT_*` id (see `abi.toml`).
+        fit: i32,
+        /// Image source: an `http(s)://` URL, a `data:` URI, or a filesystem
+        /// path (absolute, or relative to the process working directory).
+        source: String,
+    },
 }
 
 
@@ -822,9 +854,9 @@ fn div_mut(nodes: &mut [Option<UiNode>], handle: i32) -> Result<&mut UiNode, i32
         None => Err(GPUI_STATUS_INVALID_HANDLE),
         Some(None) => Err(GPUI_STATUS_NODE_ABSENT),
         Some(Some(node @ UiNode::Div { .. })) => Ok(node),
-        Some(Some(UiNode::Text { .. } | UiNode::TextInput { .. })) => {
-            Err(GPUI_STATUS_WRONG_NODE_KIND)
-        }
+        Some(Some(
+            UiNode::Text { .. } | UiNode::TextInput { .. } | UiNode::Image { .. },
+        )) => Err(GPUI_STATUS_WRONG_NODE_KIND),
     }
 }
 
@@ -896,6 +928,15 @@ fn push_node(nodes: &mut Vec<Option<UiNode>>, node: UiNode) -> i32 {
 //                     `byte_offset` (a UTF-8 byte offset into the node's
 //                     content, validated at decode) and `blink != 0` runs the
 //                     velotype-style blink; both flags are strictly 0/1)
+//   OP_IMAGE          u8 | max_w i32 | max_h i32 | fit i32 | src_len u32 | utf8[src_len]
+//                     (pushes an image leaf: `max_w`/`max_h` are upper bounds in
+//                     px (`<= 0` = unconstrained — the image lays out at its
+//                     own size, with the unclamped axis derived from the
+//                     intrinsic aspect ratio), `fit` is an `IMAGE_FIT_*` id,
+//                     and `src` is an `http(s)://` URL, a `data:` URI or a
+//                     filesystem path. The source is resolved by gpui's asset
+//                     pipeline at paint time, never here, so a remote image
+//                     cannot block the commit)
 //   OP_ADD_CHILD      u8            (pops child, then parent; re-pushes parent)
 //   OP_SET_ROOT       u8            (pops the root)
 //
@@ -1225,6 +1266,45 @@ fn build_tree_from_buffer(view: usize, data: &[u8]) -> i32 {
                     UiNode::TextInput {
                         input_id,
                         placeholder,
+                    },
+                );
+                if id < 0 {
+                    id
+                } else {
+                    stack.push(id);
+                    GPUI_STATUS_OK
+                }
+            }
+            OP_IMAGE => {
+                let (w, h) = match (reader.read_layout_f32(), reader.read_layout_f32()) {
+                    (Ok(w), Ok(h)) => (w, h),
+                    (Err(status), _) | (Ok(_), Err(status)) => return status,
+                };
+                let Some(fit) = reader.read_i32() else {
+                    return GPUI_STATUS_TRUNCATED_BUFFER;
+                };
+                if !matches!(
+                    fit,
+                    IMAGE_FIT_FILL
+                        | IMAGE_FIT_CONTAIN
+                        | IMAGE_FIT_COVER
+                        | IMAGE_FIT_SCALE_DOWN
+                        | IMAGE_FIT_NONE
+                ) {
+                    // An unknown fit id would silently render as the fallback
+                    // variant; reject it the way an unknown opcode is rejected.
+                    return GPUI_STATUS_INVALID_IMAGE_FIT;
+                }
+                let Some(source) = reader.read_string() else {
+                    return GPUI_STATUS_TRUNCATED_BUFFER;
+                };
+                let id = push_node(
+                    &mut nodes,
+                    UiNode::Image {
+                        width: if w < 0.0 { 0.0 } else { w },
+                        height: if h < 0.0 { 0.0 } else { h },
+                        fit,
+                        source,
                     },
                 );
                 if id < 0 {
@@ -1794,7 +1874,9 @@ fn build_tree_from_buffer(view: usize, data: &[u8]) -> i32 {
                 }
                 match &nodes[parent_index] {
                     None => return GPUI_STATUS_NODE_ABSENT,
-                    Some(UiNode::Text { .. } | UiNode::TextInput { .. }) => {
+                    Some(
+                        UiNode::Text { .. } | UiNode::TextInput { .. } | UiNode::Image { .. },
+                    ) => {
                         return GPUI_STATUS_WRONG_NODE_KIND;
                     }
                     Some(UiNode::Div { .. }) => {}
@@ -2017,6 +2099,14 @@ fn run_window(view: usize, width: f32, height: f32, benchmark: bool) {
     open_trace_mark("application_new");
     app.run(move |cx: &mut App| {
         open_trace_mark("nsapp_ready");
+        // Remote `OP_IMAGE` sources download through `App::http_client()`,
+        // whose default is a null client that fails every request. Install the
+        // reqwest-backed transport before the window opens so the first paint
+        // of a document with `https://` images already has somewhere to fetch
+        // from (issue #103). Building it is just an `Arc`: the Tokio runtime
+        // behind it starts lazily on the first request, so a purely local
+        // document pays nothing.
+        cx.set_http_client(std::sync::Arc::new(http::ReqwestHttpClient));
         // Attach a fresh wake channel and start the drain pump before the
         // window opens, so events posted from other threads — including any
         // backlog queued before startup — are drained as soon as the loop
@@ -4694,6 +4784,162 @@ fn scroll_handle_for(
     }
 }
 
+// --- Images (issue #103) ---------------------------------------------------
+
+/// `IMAGE_FIT_*` id → gpui `ObjectFit`.
+///
+/// The ids were validated at decode time (`GPUI_STATUS_INVALID_IMAGE_FIT`), so
+/// the fallback arm here is unreachable for a committed tree and exists only to
+/// keep the mapping total.
+fn map_image_fit(id: i32) -> ObjectFit {
+    match id {
+        IMAGE_FIT_FILL => ObjectFit::Fill,
+        IMAGE_FIT_COVER => ObjectFit::Cover,
+        IMAGE_FIT_SCALE_DOWN => ObjectFit::ScaleDown,
+        IMAGE_FIT_NONE => ObjectFit::None,
+        // `IMAGE_FIT_CONTAIN` and anything the decoder would have rejected.
+        _ => ObjectFit::Contain,
+    }
+}
+
+/// Decode a `data:` URI's payload into a gpui image source.
+///
+/// gpui's own asset pipeline understands URIs, filesystem paths and its
+/// embedded-asset source, but not `data:` — so the one scheme that needs no I/O
+/// is also the one it cannot read. Decoding it here keeps the whole
+/// provenance model in one place and costs nothing for the common case: the
+/// base64 body has no whitespace to strip in the URLs Markdown produces.
+fn image_source_from_data_uri(uri: &str) -> Option<ImageSource> {
+    use base64::Engine as _;
+    let (meta, body) = uri.split_once(',')?;
+    // `data:[<mediatype>][;base64],<data>`. Only base64 payloads are accepted;
+    // percent-encoded text payloads are not something an image pipeline sees.
+    if !meta.starts_with("data:") || !meta.contains(";base64") {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .ok()?;
+    let format = match image::guess_format(&bytes) {
+        Ok(format) => match format {
+            image::ImageFormat::Png => ImageFormat::Png,
+            image::ImageFormat::Jpeg => ImageFormat::Jpeg,
+            image::ImageFormat::Gif => ImageFormat::Gif,
+            image::ImageFormat::WebP => ImageFormat::Webp,
+            image::ImageFormat::Bmp => ImageFormat::Bmp,
+            image::ImageFormat::Tiff => ImageFormat::Tiff,
+            _ => return None,
+        },
+        // `guess_format` has no SVG arm: an SVG is XML text, so it is sniffed
+        // by prefix the same way gpui's own loader distinguishes it.
+        Err(_) if looks_like_svg(&bytes) => ImageFormat::Svg,
+        Err(_) => return None,
+    };
+    Some(ImageSource::Image(Arc::new(Image::from_bytes(format, bytes))))
+}
+
+/// True when `bytes` opens like an SVG document: an XML prolog or a root
+/// `<svg` start tag, ignoring a UTF-8 BOM and leading whitespace.
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let head = &bytes[..bytes.len().min(512)];
+    let text = String::from_utf8_lossy(head);
+    let text = text.trim_start();
+    text.starts_with("<?xml") || text.starts_with("<svg") || text.contains("<svg")
+}
+
+/// Resolve an `OP_IMAGE` source string into a gpui image source.
+///
+/// Three provenance classes, in the order they are tested:
+///
+/// * `http://` / `https://` — fetched by the window's `HttpClient` through
+///   `ImgResourceLoader`. The fetch and the decode both happen off the UI
+///   thread, so a slow or unreachable host costs a placeholder, never a frame.
+/// * `data:` — decoded in-process (see [`image_source_from_data_uri`]).
+/// * everything else — a filesystem path, read by gpui's loader. A relative
+///   path resolves against the process working directory, which is why the
+///   caller is expected to hand over resolved paths.
+fn image_source_for(source: &str) -> ImageSource {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        ImageSource::Resource(Resource::Uri(SharedUri::from(source.to_string())))
+    } else if source.starts_with("data:") {
+        image_source_from_data_uri(source)
+            .unwrap_or_else(|| ImageSource::Resource(Resource::Path(PathBuf::from(source).into())))
+    } else {
+        ImageSource::Resource(Resource::Path(PathBuf::from(source).into()))
+    }
+}
+
+/// Placeholder shown inside an image's box while it loads and after it fails.
+///
+/// The caption is the only difference between the two states: the loading delay
+/// is gpui's own (`LOADING_DELAY`, 200 ms) and it re-notifies the view itself,
+/// so a fast local file never flashes this card.
+///
+/// `box_w` / `box_h` are the node's bounds, used as the placeholder's size so
+/// the document occupies roughly the space the image will. It cannot be exact —
+/// the intrinsic size is unknown until the decode finishes — but it keeps the
+/// placeholder from being a full-width stripe on one render and a thumbnail on
+/// the next.
+fn image_placeholder(failed: bool, box_w: f32, box_h: f32) -> AnyElement {
+    let caption = if failed {
+        "image unavailable"
+    } else {
+        "loading image…"
+    };
+    let mut placeholder = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .bg(rgb(0x1c1f27))
+        .border_1()
+        .border_color(rgb(0x2f3542))
+        .text_color(rgb(0x6e7681))
+        .text_size(px(12.0))
+        .child(caption);
+    if box_w > 0.0 {
+        placeholder = placeholder.w(px(box_w));
+    } else {
+        placeholder = placeholder.w_full();
+    }
+    placeholder = placeholder.h(px(if box_h > 0.0 {
+        box_h
+    } else {
+        IMAGE_PLACEHOLDER_HEIGHT
+    }));
+    placeholder.into_any_element()
+}
+
+/// Height of a placeholder whose node left the height unconstrained.
+const IMAGE_PLACEHOLDER_HEIGHT: f32 = 180.0;
+
+/// Build the `img()` element for an `OP_IMAGE` node.
+///
+/// `max_w` / `max_h` are upper bounds, not a fixed frame (`<= 0` =
+/// unconstrained): the image lays out at its intrinsic size, clamped, and gpui
+/// derives the unclamped axis from the aspect ratio it just decoded. A fixed
+/// frame was rejected because the intrinsic size is unknown at commit time —
+/// the caller would have to guess an aspect ratio and every image whose guess
+/// was wrong would sit letterboxed in the wrong-shaped box.
+///
+/// `fit` therefore only decides how the image occupies whatever box the bounds
+/// produce; with the default `IMAGE_FIT_CONTAIN` the painted image always keeps
+/// its aspect ratio, whatever the box became.
+fn image_element(max_w: f32, max_h: f32, fit: i32, source: &str) -> AnyElement {
+    let mut el = img(image_source_for(source))
+        .object_fit(map_image_fit(fit))
+        .with_loading(move || image_placeholder(false, max_w, max_h))
+        .with_fallback(move || image_placeholder(true, max_w, max_h));
+    if max_w > 0.0 {
+        el = el.max_w(px(max_w));
+    }
+    if max_h > 0.0 {
+        el = el.max_h(px(max_h));
+    }
+    el.into_any_element()
+}
+
 /// Build the GPUI element for one committed node. `scroll_handles` is the
 /// per-view retained-handle store (see `FfiView.scroll_handles`): scroll divs
 /// look up or insert their handle here so scroll position survives the full
@@ -5137,6 +5383,12 @@ fn render_node_inner(
                 (el, _, _) => el,
             }
         }
+        UiNode::Image {
+            width,
+            height,
+            fit,
+            source,
+        } => Some(image_element(*width, *height, *fit, source)),
         UiNode::Text {
             content,
             color: (r, g, b),
@@ -5736,6 +5988,140 @@ mod text_input_tests {
             &mut out,
         );
         assert!(out.is_empty());
+    }
+
+    /// Build `OP_IMAGE(width, height, fit, source)` + `OP_SET_ROOT`.
+    fn image_buffer(width: f32, height: f32, fit: i32, source: &[u8]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"GPUI");
+        buf.extend_from_slice(&(BUFFER_VERSION as u32).to_le_bytes());
+        buf.push(OP_IMAGE as u8);
+        buf.extend_from_slice(&width.to_le_bytes());
+        buf.extend_from_slice(&height.to_le_bytes());
+        buf.extend_from_slice(&fit.to_le_bytes());
+        buf.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        buf.extend_from_slice(source);
+        buf.push(OP_SET_ROOT as u8);
+        buf
+    }
+
+    #[::core::prelude::v1::test]
+    fn image_decodes_with_its_box_fit_and_source() {
+        let _lock = TEST_VIEWS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        VIEWS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let buf = image_buffer(320.0, 0.0, IMAGE_FIT_CONTAIN, b"assets/a.png");
+        assert_eq!(build_tree_from_buffer(0, &buf), GPUI_STATUS_OK);
+        let guard = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.first().and_then(|slot| slot.as_ref()) {
+            Some(UiNode::Image {
+                width,
+                height,
+                fit,
+                source,
+            }) => {
+                assert_eq!(*width, 320.0);
+                // 0 is the "auto" operand: gpui derives the axis from the
+                // loaded image, so the decoder must not turn it into a box.
+                assert_eq!(*height, 0.0);
+                assert_eq!(*fit, IMAGE_FIT_CONTAIN);
+                assert_eq!(source, "assets/a.png");
+            }
+            _ => panic!("expected Image root"),
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn image_negative_axes_normalize_to_auto() {
+        // `read_layout_f32` clamps rather than rejects negatives (they are a
+        // legitimate "auto" sentinel in the size opcodes), so the image arm is
+        // what normalizes them to the single 0 sentinel gpui sees.
+        let _lock = TEST_VIEWS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        VIEWS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let buf = image_buffer(-1.0, -480.0, IMAGE_FIT_NONE, b"b.jpg");
+        assert_eq!(build_tree_from_buffer(0, &buf), GPUI_STATUS_OK);
+        let guard = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.first().and_then(|slot| slot.as_ref()) {
+            Some(UiNode::Image { width, height, .. }) => {
+                assert_eq!(*width, 0.0);
+                assert_eq!(*height, 0.0);
+            }
+            _ => panic!("expected Image root"),
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn image_rejects_an_out_of_range_fit_id() {
+        let _lock = TEST_VIEWS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        VIEWS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let buf = image_buffer(10.0, 10.0, IMAGE_FIT_NONE + 1, b"c.png");
+        assert_eq!(build_tree_from_buffer(0, &buf), GPUI_STATUS_INVALID_IMAGE_FIT);
+    }
+
+    #[::core::prelude::v1::test]
+    fn image_is_not_a_div_and_holds_no_text() {
+        // Two contracts one assertion each: `div_mut` must refuse an image
+        // (style opcodes target divs), and the text read-back must not leak a
+        // source path into the a11y/debug dump.
+        let image = UiNode::Image {
+            width: 1.0,
+            height: 2.0,
+            fit: IMAGE_FIT_FILL,
+            source: "secret/path.png".into(),
+        };
+        let mut nodes = vec![Some(image)];
+        assert!(matches!(
+            div_mut(&mut nodes, 0),
+            Err(GPUI_STATUS_WRONG_NODE_KIND)
+        ));
+        let mut out = Vec::new();
+        collect_text_contents(nodes[0].as_ref().unwrap(), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn image_source_classifies_by_scheme() {
+        // The three provenance classes must not be confused: a URL fed to the
+        // filesystem reader (or a path fed to the HTTP client) fails at paint
+        // time with no diagnosable trace, so pin the routing here.
+        for url in [
+            "http://example.com/a.png",
+            "https://example.com/a.png",
+        ] {
+            match image_source_for(url) {
+                ImageSource::Resource(Resource::Uri(uri)) => assert_eq!(uri.as_ref(), url),
+                _ => panic!("{url} should route to the HTTP client"),
+            }
+        }
+        for path in ["/tmp/a.png", "assets/rel.png", "C:\\docs\\a.png"] {
+            match image_source_for(path) {
+                ImageSource::Resource(Resource::Path(p)) => {
+                    assert_eq!(p.to_string_lossy(), path)
+                }
+                _ => panic!("{path} should route to the filesystem reader"),
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn image_data_uri_decodes_to_in_memory_bytes() {
+        // A 2x1 PNG: gpui's asset pipeline has no `data:` arm, so this is the
+        // one scheme whose decode is ours. Asserting the decoded *size* (not
+        // just that decode returned `Some`) is what proves the base64 payload
+        // and the format sniff both landed.
+        const PNG_2X1: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGP4z8DA8J8BAAf/Af8Bf4mnAAAAAElFTkSuQmCC";
+        match image_source_for(PNG_2X1) {
+            ImageSource::Image(image) => {
+                assert_eq!(image.format, ImageFormat::Png);
+                assert!(image.bytes.starts_with(b"\x89PNG"));
+            }
+            _ => panic!("a data: URI should decode into an in-memory image"),
+        }
+        // Anything the decoder cannot classify falls back to the path reader
+        // rather than being dropped, so the placeholder keeps a stable source.
+        match image_source_for("data:image/png;base64,bm90IGFuIGltYWdl") {
+            ImageSource::Resource(Resource::Path(_)) => {}
+            _ => panic!("an undecodable data: URI should fall back to a path"),
+        }
     }
 }
 
@@ -6545,6 +6931,12 @@ mod tests {
             ("OP_TEXT_INPUT", OP_TEXT_INPUT),
             ("OP_TEXT_RUN", OP_TEXT_RUN),
             ("OP_SET_TEXT_ROW", OP_SET_TEXT_ROW),
+            ("OP_IMAGE", OP_IMAGE),
+            ("IMAGE_FIT_FILL", IMAGE_FIT_FILL),
+            ("IMAGE_FIT_CONTAIN", IMAGE_FIT_CONTAIN),
+            ("IMAGE_FIT_COVER", IMAGE_FIT_COVER),
+            ("IMAGE_FIT_SCALE_DOWN", IMAGE_FIT_SCALE_DOWN),
+            ("IMAGE_FIT_NONE", IMAGE_FIT_NONE),
             ("RUN_STYLE_COLOR", RUN_STYLE_COLOR),
             ("RUN_STYLE_WEIGHT", RUN_STYLE_WEIGHT),
             ("RUN_STYLE_ITALIC", RUN_STYLE_ITALIC),

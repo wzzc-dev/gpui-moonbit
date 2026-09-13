@@ -117,6 +117,15 @@
 #define gpui_GPUI_STATUS_INVALID_TEXT_RUN -16
 
 /**
+ * An `OP_IMAGE` record carries an `IMAGE_FIT_*` id outside the enum (issue
+ * #103). gpui's own `ObjectFit` has no "unknown" arm, so a lenient decoder
+ * would silently substitute the fallback variant and the caller would never
+ * learn its operand was dropped; rejected per-buffer like every other
+ * malformed record.
+ */
+#define gpui_GPUI_STATUS_INVALID_IMAGE_FIT -17
+
+/**
  * Maximum number of queued injection entries (RFC 0002 §6-1). A full queue
  * fails `gpui_post_event` with `GPUI_STATUS_QUEUE_FULL` instead of blocking.
  */

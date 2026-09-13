@@ -8,6 +8,11 @@
 
 ### Added
 
+- **画像サポート（issue #103）**: `OP_IMAGE`(42) — `max_w i32 | max_h i32 | fit i32 | len u32 | utf8[len]` の leaf ノード。
+  - **gpui-sys**: `UiNode::Image` を追加し、`img()` に `max_w`/`max_h` の上界として渡す（固定画框ではない — 内在サイズは commit 時には未知で、固定枠を強いると縦横比の推測が外れた画像がすべて違う形の枠にレターボックスされる）。`fit` は新しい `[image_fit]` セクションの `IMAGE_FIT_*` id で、enum 外は `GPUI_STATUS_INVALID_IMAGE_FIT`（`-17`）として**バッファごと**拒否する。`http(s)://` は `gpui-sys/src/http.rs` の `ReqwestHttpClient`（`zed-reqwest` + 専用 Tokio current-thread ランタイム。gpui の既定 `NullHttpClient` では全リモート画像が失敗するため `run_window` で差し込む）、`data:` は `image_source_from_data_uri` が base64 復号とフォーマット判定、それ以外はファイルパスとして解決する。取得・復号・キャッシュはすべて gpui のアセットパイプラインが描画時に行うため、リモート画像が commit をブロックしない。読み込み中/失敗は `with_loading`/`with_fallback` のプレースホルダカード（`max_w`×`max_h`、遅延は gpui の `LOADING_DELAY`）。
+  - **moonbit-bindings**: `CommandBuffer::image(source, width, height, fit)`、`IMAGE_FIT_{FILL,CONTAIN,COVER,SCALE_DOWN,NONE}`、`GpuiError::InvalidImageFit`（`-17`）。あわせて既存の `GPUI_STATUS_INVALID_TEXT_RUN`（`-16`）も分類に追加（`GpuiError::InvalidTextRun`）— 以前は `Unknown(-16)` に落ちていた。
+  - **テスト**: Rust 側 4 本（デコード・負値の自動正規化・enum 外 fit の拒否・非 div/非テキスト契約）＋ 2 本（`data:` 復号とスキーム分類）、ネットワーク往復 2 本（`#[ignore]`、手動実行）。MoonBit 側 wire format 2 本。fuzz の `LEGAL_STATUSES`/`OPCODES` と構造化ジェネレータに `OP_IMAGE` を追加（fit id は enum から抽選 — 完全乱数だと全バッファが拒否され「デコード可能な木を生成する」サニティ検査が空洞化するため）。
+
 - **App-level IME bridge for custom-drawn editors**（自绘编辑器的 IME 修复，md_mbt 消费者需求）: 从不提交 `OP_TEXT_INPUT` 的应用（`rich_text` + 应用级键处理的编辑器）窗口内没有 input handler，macOS IME 的 `NSTextInputClient` 查询全部落空——组词无法登记、提交被丢弃、raw 拼音字母已被当作 `EVENT_TEXT` 插入。gpui-sys 以纯附加方式补齐（`ABI_VERSION` 据置、既存 opcode/事件信封不变）:
   - `ImeBridge`（实现 gpui `InputHandler`）经 `ImeBridgeProbe` 包装元素在每次 paint 时 `Window::handle_input` 注册；marked range 存 `IME_MARKED` 静态表（重注册不丢组合状态），真实 text-input widget 的 paint 注册随后覆盖（RFC 0003 行为不变）。
   - 提交（`replace_text_in_range`）→ `EVENT_TEXT`（与普通键入同一载荷路径）；组词更新/取消 → `EVENT_ASYNC`（`0xEE` 标记 + UTF-8 组合文本，app 私有契约）；派发后 `window.refresh()` 请求重绘。

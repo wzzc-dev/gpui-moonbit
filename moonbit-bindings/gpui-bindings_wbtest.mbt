@@ -496,6 +496,8 @@ test "classify_status maps every GPUI_STATUS_* code" {
   assert_eq(classify_status(-13).code(), -13)
   assert_eq(classify_status(-14).code(), -14)
   assert_eq(classify_status(-15).code(), -15)
+  assert_eq(classify_status(-16).code(), -16)
+  assert_eq(classify_status(-17).code(), -17)
   match classify_status(-1) {
     InvalidHandle => ()
     _ => fail("expected InvalidHandle")
@@ -795,4 +797,48 @@ test "set_text_row clamps caret_char past the end to the row end" {
   assert_eq(b[22].to_int(), OP_SET_TEXT_ROW)
   assert_eq(b[28].to_int(), 1) // has_caret stays 1
   assert_eq(read_u32_le(b, 29), 2) // clamped to byte offset 2 == row end
+}
+
+// --- image wire format (issue #103) ------------------------------------------
+//
+// OP_IMAGE is ABI-frozen at 42:
+// opcode u8 | width f32 LE | height f32 LE | fit i32 LE | src_len u32 LE | src bytes.
+// The box operands lead and the source trails, so a truncated record is caught
+// by the length reader before any bytes are interpreted as a path.
+
+///|
+test "image wire format matches the Rust decoder layout" {
+  let cb = CommandBuffer::new()
+  cb.image("a/图.png", 320.0, 180.0, IMAGE_FIT_CONTAIN)
+  cb.set_root()
+  let b = cb.to_bytes()
+  // OP_IMAGE starts right after the 8-byte header.
+  assert_eq(b[8].to_int(), OP_IMAGE)
+  assert_eq(read_f32_le(b, 9), 320.0)
+  assert_eq(read_f32_le(b, 13), 180.0)
+  assert_eq(read_i32_le(b, 17), IMAGE_FIT_CONTAIN)
+  // "a/图.png" is 5 chars but 9 UTF-8 bytes.
+  assert_eq(read_u32_le(b, 21), 9)
+  assert_eq(b[25], b'a')
+  assert_eq(b[26], b'/')
+  // UTF-8 for 图 is E5 9B BE.
+  assert_eq(b[27].to_int(), 0xE5)
+  assert_eq(b[28].to_int(), 0x9B)
+  assert_eq(b[29].to_int(), 0xBE)
+  assert_eq(b[33], b'g')
+  assert_eq(b[34].to_int(), OP_SET_ROOT)
+  assert_eq(b.length(), 35)
+}
+
+///|
+test "image auto axes encode as zero so the decoder leaves them to the image" {
+  let cb = CommandBuffer::new()
+  cb.image("x.png", 0.0, 0.0, IMAGE_FIT_NONE)
+  cb.set_root()
+  let b = cb.to_bytes()
+  assert_eq(b[8].to_int(), OP_IMAGE)
+  assert_eq(read_f32_le(b, 9), 0.0)
+  assert_eq(read_f32_le(b, 13), 0.0)
+  assert_eq(read_i32_le(b, 17), IMAGE_FIT_NONE)
+  assert_eq(read_u32_le(b, 21), 5)
 }

@@ -2374,13 +2374,17 @@ dependencies = [
 name = "gpui-sys"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cbindgen",
  "cc",
  "criterion",
  "futures",
  "gpui",
+ "image",
  "rand 0.9.5",
  "stacker",
+ "tokio",
+ "zed-reqwest",
 ]
 
 [[package]]

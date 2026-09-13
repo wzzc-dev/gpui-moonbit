@@ -61,6 +61,16 @@ pub const EVENT_SCROLL : Int = 8
 
 pub const EVENT_TEXT : Int = 3
 
+pub const IMAGE_FIT_CONTAIN : Int = 1
+
+pub const IMAGE_FIT_COVER : Int = 2
+
+pub const IMAGE_FIT_FILL : Int = 0
+
+pub const IMAGE_FIT_NONE : Int = 4
+
+pub const IMAGE_FIT_SCALE_DOWN : Int = 3
+
 pub const JUSTIFY_CENTER : Int = 2
 
 pub const JUSTIFY_DEFAULT : Int = 0
@@ -112,6 +122,8 @@ pub const MOD_SHIFT : Int = 4
 pub const OP_ADD_CHILD : Int = 11
 
 pub const OP_DIV : Int = 1
+
+pub const OP_IMAGE : Int = 42
 
 pub const OP_SET_ALIGN : Int = 20
 
@@ -313,6 +325,7 @@ pub struct CommandBuffer {
 }
 pub fn CommandBuffer::add_child(Self) -> Unit
 pub fn CommandBuffer::div(Self) -> Unit
+pub fn CommandBuffer::image(Self, String, Float, Float, Int) -> Unit
 pub fn CommandBuffer::new() -> Self
 pub fn CommandBuffer::rich_text(Self, Array[(String, RunStyle?)], Int, Int, Int, Float) -> Unit
 #deprecated
@@ -388,6 +401,8 @@ pub enum GpuiError {
   BusyComposing
   InvalidFloat
   DepthExceeded
+  InvalidTextRun
+  InvalidImageFit
   Unknown(Int)
 }
 pub fn GpuiError::code(Self) -> Int

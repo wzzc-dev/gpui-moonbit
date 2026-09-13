@@ -12,25 +12,25 @@
 //! is a separate crate and never builds as part of the main workspace.
 
 use crate::abi_constants::{
-    BUFFER_VERSION, OP_ADD_CHILD, OP_DIV, OP_SET_ALIGN, OP_SET_BG, OP_SET_BG_COLOR, OP_SET_BORDER,
-    OP_SET_CENTER, OP_SET_CURSOR, OP_SET_FLEX, OP_SET_FLEX_ITEM, OP_SET_FONT_FAMILY,
-    OP_SET_FONT_WEIGHT, OP_SET_GAP, OP_SET_INSET, OP_SET_KEY, OP_SET_LINE_HEIGHT, OP_SET_MARGIN,
-    OP_SET_MAX_SIZE, OP_SET_MIN_SIZE, OP_SET_ON_CLICK, OP_SET_OPACITY, OP_SET_OVERFLOW,
-    OP_SET_PADDING, OP_SET_PADDING_SIDES, OP_SET_POSITION, OP_SET_ROOT, OP_SET_ROUNDED,
-    OP_SET_SHADOW, OP_SET_SIZE, OP_SET_TEXT_ALIGN, OP_SET_TEXT_COLOR, OP_SET_TEXT_ROW,
-    OP_SET_TEXT_SIZE, OP_SET_WHITESPACE, OP_TEXT, OP_TEXT_RUN,
+    BUFFER_VERSION, IMAGE_FIT_NONE, OP_ADD_CHILD, OP_DIV, OP_IMAGE, OP_SET_ALIGN, OP_SET_BG,
+    OP_SET_BG_COLOR, OP_SET_BORDER, OP_SET_CENTER, OP_SET_CURSOR, OP_SET_FLEX, OP_SET_FLEX_ITEM,
+    OP_SET_FONT_FAMILY, OP_SET_FONT_WEIGHT, OP_SET_GAP, OP_SET_INSET, OP_SET_KEY,
+    OP_SET_LINE_HEIGHT, OP_SET_MARGIN, OP_SET_MAX_SIZE, OP_SET_MIN_SIZE, OP_SET_ON_CLICK,
+    OP_SET_OPACITY, OP_SET_OVERFLOW, OP_SET_PADDING, OP_SET_PADDING_SIDES, OP_SET_POSITION,
+    OP_SET_ROOT, OP_SET_ROUNDED, OP_SET_SHADOW, OP_SET_SIZE, OP_SET_TEXT_ALIGN, OP_SET_TEXT_COLOR,
+    OP_SET_TEXT_ROW, OP_SET_TEXT_SIZE, OP_SET_WHITESPACE, OP_TEXT, OP_TEXT_RUN,
 };
 use crate::{
     GPUI_STATUS_BAD_BUFFER_VERSION, GPUI_STATUS_DEPTH_EXCEEDED, GPUI_STATUS_DUPLICATE_KEY,
     GPUI_STATUS_INTERNAL_PANIC, GPUI_STATUS_INVALID_FLOAT, GPUI_STATUS_INVALID_HANDLE,
-    GPUI_STATUS_INVALID_TEXT_RUN, GPUI_STATUS_NO_ROOT, GPUI_STATUS_NODE_ABSENT, GPUI_STATUS_OK,
-    GPUI_STATUS_TRUNCATED_BUFFER, GPUI_STATUS_UNKNOWN_OPCODE, GPUI_STATUS_WRONG_NODE_KIND,
-    MAX_TREE_DEPTH, build_tree_from_buffer,
+    GPUI_STATUS_INVALID_IMAGE_FIT, GPUI_STATUS_INVALID_TEXT_RUN, GPUI_STATUS_NO_ROOT,
+    GPUI_STATUS_NODE_ABSENT, GPUI_STATUS_OK, GPUI_STATUS_TRUNCATED_BUFFER,
+    GPUI_STATUS_UNKNOWN_OPCODE, GPUI_STATUS_WRONG_NODE_KIND, MAX_TREE_DEPTH, build_tree_from_buffer,
 };
 use gpui::TestAppContext;
 
 /// The full set of statuses the decoder may legally return.
-const LEGAL_STATUSES: [i32; 13] = [
+const LEGAL_STATUSES: [i32; 14] = [
     GPUI_STATUS_OK,
     GPUI_STATUS_INVALID_HANDLE,
     GPUI_STATUS_WRONG_NODE_KIND,
@@ -49,6 +49,9 @@ const LEGAL_STATUSES: [i32; 13] = [
     // Random OP_TEXT_RUN operands rarely satisfy the range/boundary/flag
     // validation, so rejection is the expected fuzz outcome (issue #91).
     GPUI_STATUS_INVALID_TEXT_RUN,
+    // Same story for random OP_IMAGE fit ids: five values in range, the rest of
+    // the i32 space out of it (issue #103).
+    GPUI_STATUS_INVALID_IMAGE_FIT,
 ];
 
 /// xorshift64* — tiny, fast, deterministic. Plenty of statistical quality for
@@ -77,7 +80,7 @@ impl Rng {
 }
 
 /// Every real opcode, so the structured generator exercises all decode arms.
-const OPCODES: [i32; 36] = [
+const OPCODES: [i32; 37] = [
     OP_DIV,
     OP_TEXT,
     OP_TEXT_RUN,
@@ -112,6 +115,7 @@ const OPCODES: [i32; 36] = [
     OP_SET_WHITESPACE,
     OP_SET_FONT_FAMILY,
     OP_SET_TEXT_ROW,
+    OP_IMAGE,
     OP_ADD_CHILD,
     OP_SET_ROOT,
 ];
@@ -166,6 +170,21 @@ fn emit_operands(rng: &mut Rng, buf: &mut Vec<u8>, opcode: i32) {
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&rng.bytes(len as usize));
             buf.extend_from_slice(&rng.bytes(9));
+            return;
+        }
+        // max_w f32 | max_h f32 | fit i32 + src_len u32 + src bytes (#103).
+        // Same length-prefixed shape as the text ops, so a random length must
+        // land on TRUNCATED_BUFFER rather than a panic. The fit id is drawn
+        // from the enum on purpose: an out-of-range one rejects the *whole*
+        // buffer, and 12 random bytes are out of range with probability
+        // ~1 - 5/2^32, which would quietly turn this into "generate nothing
+        // decodable". The rejection path has its own unit test.
+        OP_IMAGE => {
+            buf.extend_from_slice(&rng.bytes(8));
+            buf.extend_from_slice(&rng.below((IMAGE_FIT_NONE + 1) as u32).to_le_bytes());
+            let len = rng.below(64);
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&rng.bytes(len as usize));
             return;
         }
         _ => unreachable!("OPCODES is exhaustive"),

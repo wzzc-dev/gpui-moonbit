@@ -2,8 +2,9 @@
 // opcodes. These add NO ABI surface: each helper only sequences `div` / `text`
 // and the setters already defined in gpui-bindings.mbt, so the wire format and
 // the Rust decoder are unchanged. Widgets that genuinely need new machinery
-// (image/svg asset pipeline, editable text input, virtualized list) are deferred
-// — see docs/framework-gaps.md G6.
+// (editable text input landed in issue #88 as `OP_TEXT_INPUT`, the image opcode
+// in issue #103 as `OP_IMAGE`; a virtualized list stays deferred) — see
+// docs/framework-gaps.md G6.
 
 ///|
 /// チェックボックスをコマンドバッファに出力する合成ウィジェットです。☐/☑ グリフと

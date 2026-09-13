@@ -36,6 +36,8 @@ pub enum GpuiError {
   BusyComposing // GPUI_STATUS_BUSY_COMPOSING (-13)
   InvalidFloat // GPUI_STATUS_INVALID_FLOAT (-14)
   DepthExceeded // GPUI_STATUS_DEPTH_EXCEEDED (-15)
+  InvalidTextRun // GPUI_STATUS_INVALID_TEXT_RUN (-16)
+  InvalidImageFit // GPUI_STATUS_INVALID_IMAGE_FIT (-17)
   Unknown(Int) // any other code
 }
 
@@ -60,6 +62,8 @@ pub fn classify_status(code : Int) -> GpuiError {
     -13 => BusyComposing
     -14 => InvalidFloat
     -15 => DepthExceeded
+    -16 => InvalidTextRun
+    -17 => InvalidImageFit
     _ => Unknown(code)
   }
 }
@@ -88,6 +92,10 @@ pub fn status_message(code : Int) -> String {
       "command buffer carried a non-finite f32 geometry operand (NaN or infinity): fix the value before submitting"
     DepthExceeded =>
       "command buffer nests deeper than the supported tree depth: flatten the tree before submitting"
+    InvalidTextRun =>
+      "OP_TEXT_RUN range or flags are invalid for its text node: fix the run offsets before submitting"
+    InvalidImageFit =>
+      "OP_IMAGE carried an unknown object-fit id: pass one of the IMAGE_FIT_* constants"
     Unknown(c) => "unknown status code \{c}"
   }
 }
@@ -111,6 +119,8 @@ pub fn GpuiError::code(self : GpuiError) -> Int {
     BusyComposing => -13
     InvalidFloat => -14
     DepthExceeded => -15
+    InvalidTextRun => -16
+    InvalidImageFit => -17
     Unknown(c) => c
   }
 }
@@ -442,6 +452,31 @@ pub fn CommandBuffer::text_input(
   self.op(OP_TEXT_INPUT)
   self.buf.write_int_le(input_id)
   self.write_str(placeholder)
+}
+
+///|
+/// 新しい画像ノードをプッシュします（issue #103）。
+///
+/// `width` / `height` はボックスの px 指定で、`<= 0` は自動（幅は自然幅、
+/// 高さは読み込んだ画像の縦横比から算出）です。`fit` は `IMAGE_FIT_*` の
+/// いずれかで、範囲外の id は Rust デコーダが**バッファごと**拒否します。
+/// `source` は `http(s)://` URL・`data:` URI・ファイルパスのいずれかです。
+///
+/// 取得とデコードは gpui のアセットパイプラインが描画時に行うため、
+/// リモート画像が commit をブロックすることはありません。読み込み中と
+/// 失敗時は `width` × `height` のボックスにプレースホルダが描かれます。
+pub fn CommandBuffer::image(
+  self : CommandBuffer,
+  source : String,
+  width : Float,
+  height : Float,
+  fit : Int,
+) -> Unit {
+  self.op(OP_IMAGE)
+  self.buf.write_float_le(width)
+  self.buf.write_float_le(height)
+  self.buf.write_int_le(fit)
+  self.write_str(source)
 }
 
 ///|

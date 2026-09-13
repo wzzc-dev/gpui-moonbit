@@ -44,6 +44,36 @@ futures = "0.3"
 # code. gpui already pulls this crate in; the direct dependency makes the
 # guarantee ours rather than incidental.
 stacker = "0.1"
+# `data:` image URIs (issue #103). gpui's asset pipeline covers URIs, paths and
+# its embedded-asset source but has no `data:` arm, so the one scheme that needs
+# no I/O is decoded here. Both crates are already in the tree through gpui
+# (`base64` via zed-reqwest, `image` as a direct gpui dependency), so naming
+# them costs no extra compilation — only the guarantee that the versions we
+# decode with are the versions the rest of the stack decodes with.
+base64 = "0.22"
+image = "0.25"
+# Asynchronous HTTPS for `https://` image sources (issue #103). gpui's
+# `ImgResourceLoader` downloads through `App::http_client()`, whose default is
+# `NullHttpClient` — every remote image would fail without a real one, and Zed's
+# `reqwest_client` wrapper around this crate is not published. We depend on the
+# same `zed-reqwest` build gpui_http_client already links, under the same
+# `default-features = false` + rustls configuration, so feature unification
+# neither adds a TLS backend nor changes what the HTTP stack can do.
+reqwest = { version = "0.12.15-zed", package = "zed-reqwest", default-features = false, features = [
+    "charset",
+    "http2",
+    "macos-system-configuration",
+    "rustls-tls-native-roots",
+    "socks",
+    "stream",
+] }
+# `reqwest`'s async client needs a Tokio reactor for its timeouts and I/O
+# driver, while gpui drives futures on its own smol executor. `http.rs` owns a
+# dedicated current-thread runtime for exactly that reason; these features are
+# the minimum that runtime needs (`rt` to build it, `time`/`net` for
+# `enable_all`). tokio is already in the tree through hyper/reqwest, and none of
+# these features pull a new crate in.
+tokio = { version = "1", features = ["rt", "time", "net"] }
 
 [build-dependencies]
 cbindgen = "0.28"
