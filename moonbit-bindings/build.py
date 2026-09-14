@@ -316,19 +316,19 @@ def main():
         log(f"RUSTFLAGS={os.environ['RUSTFLAGS']}")
 
     # --- cargo profile ---
-    # Windows must build gpui-sys with `--release`: gpui's debug profile
-    # (`debug_assertions`) does not embed the precompiled shader bytes and
-    # instead compiles the HLSL at runtime from the *build machine's* source
-    # tree (`D3DCompileFromFile` + `CARGO_MANIFEST_DIR`). A debug-built binary
-    # run on any other machine therefore dies at startup with
-    # "Error creating DirectWriteTextSystem". Release embeds the shader bytes
-    # (built by gpui's build.rs via fxc) and the artifact is self-contained.
-    if os_pkg == "windows":
-        cargo_profile = ["--release"]
-        profile_dir = "release"
-    else:
-        cargo_profile = []
-        profile_dir = "debug"
+    # All platforms build gpui-sys with `--release`. For Windows this is a
+    # correctness requirement: gpui's debug profile (`debug_assertions`) does
+    # not embed the precompiled shader bytes and instead compiles the HLSL at
+    # runtime from the *build machine's* source tree (`D3DCompileFromFile` +
+    # `CARGO_MANIFEST_DIR`). A debug-built binary run on any other machine
+    # therefore dies at startup with "Error creating DirectWriteTextSystem".
+    # Release embeds the shader bytes (built by gpui's build.rs via fxc) and
+    # the artifact is self-contained. For macOS/Linux the driver is binary
+    # size: the debug staticlib (~550 MB, debug_assertions + full debuginfo)
+    # links into a ~115 MB executable, while release links to a fraction of
+    # that.
+    cargo_profile = ["--release"]
+    profile_dir = "release"
 
     # --- Determine the Rust library directory ---
     result = run(
