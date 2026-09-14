@@ -2225,6 +2225,10 @@ struct WindowBenchmark {
     stride: f32,
     document_load_ms: f64,
     started: std::time::Instant,
+    // first_interactive 的计时基准补偿：MoonBit 侧在读取文件/解析文档/
+    // 构建命令树之后才进入本 FFI，这些成本必须计入打开指标。base =
+    // (FFI 入口的 epoch 毫秒) − (MoonBit load_started epoch 毫秒)。
+    clock_base_ms: f64,
     previous_frame: Option<std::time::Instant>,
     action_started: Option<std::time::Instant>,
     pending_work_ms: f64,
@@ -2282,17 +2286,34 @@ pub extern "C" fn gpui_run_window_benchmark(
     target: i32,
     stride: f32,
     document_load_ms: f64,
+    moon_started_epoch_ms: f64,
 ) -> i32 {
     ffi_export("gpui_run_window_benchmark", || {
         if view < 0 || !(0..=2).contains(&scenario) || target <= 0 {
             return GPUI_STATUS_INVALID_HANDLE;
         }
+        let epoch_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        // MoonBit 侧在读取文件/解析文档/构建命令树之后才进入本 FFI；
+        // 打开指标必须从 MoonBit 计时起点（读文件之前）起算。时钟同源
+        // （同进程 epoch 毫秒），异常输入退化为旧口径（仅窗口内计时）。
+        let clock_base_ms = if moon_started_epoch_ms > 0.0
+            && epoch_now_ms >= moon_started_epoch_ms
+            && moon_started_epoch_ms < 4_000_000_000_000.0
+        {
+            epoch_now_ms - moon_started_epoch_ms
+        } else {
+            0.0
+        };
         *WINDOW_BENCHMARK.lock().unwrap_or_else(|e| e.into_inner()) = Some(WindowBenchmark {
             scenario,
             target: target as usize,
             stride,
             document_load_ms,
             started: std::time::Instant::now(),
+            clock_base_ms,
             previous_frame: None,
             action_started: None,
             pending_work_ms: 0.0,
@@ -2431,7 +2452,8 @@ fn benchmark_frame_tick(window: &mut Window, cx: &mut App, view: i32, entity: &W
         let mut guard = WINDOW_BENCHMARK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(st) = guard.as_mut() else { return };
         if st.previous_frame.is_none() {
-            st.first_interactive_ms = benchmark_milliseconds(st.started, now);
+            st.first_interactive_ms =
+                st.clock_base_ms + benchmark_milliseconds(st.started, now);
             // on_next_frame can run before the first render pass. Arm a
             // second callback for open so the first work sample is taken only
             // after request_layout/prepaint/paint has completed.
